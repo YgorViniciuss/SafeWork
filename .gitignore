@@ -1,0 +1,4 @@
+.vs/
+*.vsidx
+__pycache__/
+venv/

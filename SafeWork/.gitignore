@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Pesos, evidências e logs não vão para o repositório
+models/*.pt
+evidences/*
+logs/*
+data/*
+!models/.gitkeep
+!evidences/.gitkeep
+!logs/.gitkeep
+!data/.gitkeep

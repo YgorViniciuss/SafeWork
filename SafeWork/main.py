@@ -1,0 +1,54 @@
+"""SafeWork - ponto de entrada pela linha de comando.
+
+Exemplos:
+    python main.py                               monitora a fonte do settings.yaml
+    python main.py --edit-zones                  desenha as zonas de risco
+    python main.py --source data/teste.mp4       usa um vídeo
+    python main.py --source data/teste.mp4 --headless --output logs/saida.mp4
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from dataclasses import replace
+
+from safework.app import SafeWorkApp
+from safework.core.config import ConfigError, Settings
+from safework.utils.logger import setup_logging
+
+logger = logging.getLogger("safework.main")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="SafeWork - monitoramento de EPIs")
+    parser.add_argument("--config", default="config/settings.yaml", help="arquivo de configuração")
+    parser.add_argument("--source", help="substitui a fonte: índice, URL RTSP ou arquivo")
+    parser.add_argument("--edit-zones", action="store_true", help="abre o editor de zonas")
+    parser.add_argument("--headless", action="store_true", help="executa sem janela")
+    parser.add_argument("--output", help="grava o vídeo anotado neste arquivo .mp4")
+    parser.add_argument("--max-frames", type=int, default=0, help="encerra após N frames")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    setup_logging()
+    try:
+        settings = Settings.load(args.config)
+    except ConfigError as exc:
+        logger.error("%s", exc)
+        return 2
+
+    if args.source is not None:
+        settings = replace(settings, camera=replace(settings.camera, source=args.source))
+
+    app = SafeWorkApp(settings)
+    if args.edit_zones:
+        return app.edit_zones()
+    return app.run(headless=args.headless, output=args.output, max_frames=args.max_frames)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
