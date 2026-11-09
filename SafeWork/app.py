@@ -9,6 +9,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from safework.audit import AuditRepository, EvidenceStore, ViolationAuditor
 from safework.core.config import Settings, resolve_path
 from safework.core.models import FrameAnalysis
 from safework.logic import (
@@ -16,9 +17,17 @@ from safework.logic import (
     AlertSnapshot,
     AlertState,
     EventBus,
+    EventType,
     LoggingAlertListener,
 )
-from safework.notification import AlarmPlayer, AlertOverlay, SilentBackend, create_backend
+from safework.notification import (
+    AlarmPlayer,
+    AlertOverlay,
+    EmailNotifier,
+    NullNotifier,
+    SilentBackend,
+    create_backend,
+)
 from safework.notification.sound import SoundBackend
 from safework.vision.capture import VideoSource
 from safework.vision.detector import YoloDetector
@@ -40,9 +49,58 @@ class SafeWorkApp:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._zones = ZoneRepository(resolve_path(settings.zones_file))
-        # Ponto de extensão: os Módulos 3 (auditoria) e 4 (e-mail) se inscrevem aqui.
         self.events = EventBus()
         self.events.subscribe(LoggingAlertListener(settings.camera))
+
+        # Módulo 3: evidência, auditoria e e-mail, inscritos na infração confirmada.
+        self.audit = AuditRepository(resolve_path(settings.audit.database))
+        self.notifier = self._build_notifier()
+        self.events.subscribe(
+            ViolationAuditor(
+                store=EvidenceStore(settings.evidence, settings.camera.id),
+                repository=self.audit,
+                notifier=self.notifier,
+                camera=settings.camera,
+            ),
+            [EventType.VIOLATION_CONFIRMED, EventType.VIOLATION_REMINDER],
+        )
+
+    def _build_notifier(self) -> EmailNotifier | NullNotifier:
+        config = self._settings.email
+        if not config.enabled:
+            logger.info("Notificação por e-mail desativada (email.enabled: false).")
+            return NullNotifier()
+        if config.username and not config.resolved_password():
+            logger.warning("SMTP sem senha: defina a variável %s ou email.password.",
+                           config.password_env)
+        # O resultado do envio volta para a auditoria (status enviado/falhou).
+        return EmailNotifier(config, on_result=self.audit.update_email_status)
+
+    def verify_audit(self) -> int:
+        """Confere a cadeia de hashes da auditoria e as imagens de evidência."""
+        problems = self.audit.verify()
+        total = self.audit.count()
+        if problems:
+            for problem in problems:
+                logger.error("%s", problem)
+            logger.error("Trilha de auditoria COMPROMETIDA: %d problema(s) em %d registro(s).",
+                         len(problems), total)
+            return 1
+        logger.info("Trilha de auditoria íntegra: %d registro(s) em %s.", total, self.audit.path)
+        return 0
+
+    def test_email(self) -> int:
+        """Envia um e-mail de teste e informa o resultado."""
+        if not isinstance(self.notifier, EmailNotifier):
+            logger.error("Ative email.enabled no settings.yaml antes de testar.")
+            return 1
+        try:
+            self.notifier.send_test()
+        except Exception as exc:
+            logger.error("Falha no envio de teste: %s: %s", type(exc).__name__, exc)
+            return 1
+        logger.info("E-mail de teste enviado para %s.", ", ".join(self._settings.email.recipients))
+        return 0
 
     def edit_zones(self) -> int:
         """Captura um frame da fonte e abre o editor de ROI."""
@@ -86,7 +144,7 @@ class SafeWorkApp:
         last_frame_at = time.monotonic()
         source = VideoSource(settings.camera)
         try:
-            with source, alarm:
+            with source, alarm, self.notifier:
                 logger.info("Alarme sonoro: %s.", alarm.backend_name)
                 for result in pipeline.stream(source):
                     if result is None:

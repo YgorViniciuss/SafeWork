@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -122,6 +123,64 @@ class SoundConfig:
 
 
 @dataclass(frozen=True)
+class EvidenceConfig:
+    """Prints de evidência (Módulo 3)."""
+
+    directory: str = "evidences"
+    jpeg_quality: int = 95  # 0-100; 95 mantém detalhes com tamanho razoável
+
+    def __post_init__(self) -> None:
+        if not 50 <= self.jpeg_quality <= 100:
+            raise ConfigError("evidence.jpeg_quality deve estar entre 50 e 100.")
+
+
+@dataclass(frozen=True)
+class AuditConfig:
+    """Trilha de auditoria em SQLite (Módulo 3)."""
+
+    database: str = "data/safework_audit.db"
+
+
+@dataclass(frozen=True)
+class EmailConfig:
+    """Servidor SMTP e destinatários das notificações (Módulo 3)."""
+
+    enabled: bool = False
+    host: str = "smtp.gmail.com"
+    port: int = 587
+    security: str = "starttls"   # starttls (587) | ssl (465) | none (servidor local de teste)
+    username: str = ""
+    password: str = ""
+    password_env: str = "SAFEWORK_SMTP_PASSWORD"  # se definida, tem prioridade sobre password
+    sender: str = ""
+    recipients: tuple[str, ...] = ()
+    timeout_s: float = 15.0
+    max_retries: int = 3
+    retry_delay_s: float = 5.0
+    queue_size: int = 100
+    shutdown_timeout_s: float = 10.0  # tempo para enviar pendências ao encerrar
+
+    def __post_init__(self) -> None:
+        if self.security not in ("starttls", "ssl", "none"):
+            raise ConfigError("email.security deve ser starttls, ssl ou none.")
+        if not 1 <= self.port <= 65535:
+            raise ConfigError("email.port inválida.")
+        if self.max_retries < 1 or self.queue_size < 1:
+            raise ConfigError("email.max_retries e email.queue_size devem ser >= 1.")
+        if self.enabled:
+            if not self.host or not self.sender or not self.recipients:
+                raise ConfigError("Com email.enabled, informe host, sender e recipients.")
+            invalid = [item for item in (self.sender, *self.recipients) if "@" not in item]
+            if invalid:
+                raise ConfigError(f"Endereço de e-mail inválido: {', '.join(invalid)}")
+
+    def resolved_password(self) -> str:
+        """Senha da variável de ambiente, se existir; senão a do arquivo."""
+        from_env = os.environ.get(self.password_env, "") if self.password_env else ""
+        return from_env or self.password
+
+
+@dataclass(frozen=True)
 class DisplayConfig:
     window_name: str = "SafeWork - Monitoramento"
     zone_opacity: float = 0.25
@@ -136,6 +195,9 @@ class Settings:
     display: DisplayConfig = field(default_factory=DisplayConfig)
     alerts: AlertConfig = field(default_factory=AlertConfig)
     sound: SoundConfig = field(default_factory=SoundConfig)
+    evidence: EvidenceConfig = field(default_factory=EvidenceConfig)
+    audit: AuditConfig = field(default_factory=AuditConfig)
+    email: EmailConfig = field(default_factory=EmailConfig)
     zones_file: str = "config/zones.json"
 
     @classmethod
@@ -156,6 +218,11 @@ class Settings:
             for key in ("warning_tone", "violation_tone"):
                 if key in sound:
                     sound[key] = tuple(int(value) for value in sound[key])
+            email = dict(raw.get("email") or {})
+            recipients = email.get("recipients", ())
+            if isinstance(recipients, str):  # aceita um único endereço como texto
+                recipients = [recipients]
+            email["recipients"] = tuple(str(item).strip() for item in recipients or ())
             return cls(
                 camera=CameraConfig(**(raw.get("camera") or {})),
                 preprocessing=PreprocessingConfig(**(raw.get("preprocessing") or {})),
@@ -164,6 +231,9 @@ class Settings:
                 display=DisplayConfig(**(raw.get("display") or {})),
                 alerts=AlertConfig(**(raw.get("alerts") or {})),
                 sound=SoundConfig(**sound),
+                evidence=EvidenceConfig(**(raw.get("evidence") or {})),
+                audit=AuditConfig(**(raw.get("audit") or {})),
+                email=EmailConfig(**email),
                 zones_file=raw.get("zones_file", "config/zones.json"),
             )
         except TypeError as exc:  # chave desconhecida no YAML

@@ -59,6 +59,32 @@ sound:
   warning_tone: [880, 200, 300]    # [Hz, duração ms, pausa ms] - Estado 1
   violation_tone: [1320, 400, 100] # Estado 2
 
+evidence:                   # Módulo 3 - prints de evidência
+  directory: "evidences"
+  jpeg_quality: 95          # a resolução é a de processamento (preprocessing.target_width)
+
+audit:
+  database: "data/safework_audit.db"   # trilha de auditoria SQLite
+
+email:                      # Módulo 3 - notificação SMTP assíncrona
+  enabled: false            # ative depois de preencher os dados abaixo
+  host: "smtp.gmail.com"
+  port: 587
+  security: "starttls"      # starttls (porta 587) | ssl (porta 465) | none (teste local)
+  username: "safework.alertas@gmail.com"
+  # Prefira a variável de ambiente SAFEWORK_SMTP_PASSWORD: ela tem prioridade e
+  # evita que a senha vá para o GitHub. No Gmail, use uma "senha de app".
+  password: ""
+  password_env: "SAFEWORK_SMTP_PASSWORD"
+  sender: "safework.alertas@gmail.com"
+  recipients:
+    - "tecnico.seguranca@empresa.com.br"
+  timeout_s: 15
+  max_retries: 3            # tentativas por e-mail
+  retry_delay_s: 5          # espera inicial entre tentativas (dobra a cada falha)
+  queue_size: 100
+  shutdown_timeout_s: 10    # ao encerrar, aguarda até isto para enviar pendências
+
 zones_file: "config/zones.json"
 
 display:

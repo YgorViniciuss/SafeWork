@@ -6,6 +6,8 @@ Exemplos:
     python main.py --source data/teste.mp4       usa um vídeo
     python main.py --source data/teste.mp4 --headless --output logs/saida.mp4
     python main.py --mute                        monitora sem alarme sonoro
+    python main.py --test-email                  envia um e-mail de teste
+    python main.py --verify-audit                confere a integridade da auditoria
 """
 
 from __future__ import annotations
@@ -33,6 +35,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mute", action="store_true", help="desativa o alarme sonoro")
     parser.add_argument("--warning-seconds", type=float,
                         help="substitui alerts.warning_seconds (padrão: 5 s)")
+    parser.add_argument("--test-email", action="store_true",
+                        help="envia um e-mail de teste com a configuração SMTP e sai")
+    parser.add_argument("--verify-audit", action="store_true",
+                        help="confere a cadeia de hashes e as evidências e sai")
     return parser.parse_args()
 
 
@@ -56,6 +62,10 @@ def main() -> int:
         settings = replace(settings, alerts=alerts)
 
     app = SafeWorkApp(settings)
+    if args.verify_audit:
+        return app.verify_audit()
+    if args.test_email:
+        return app.test_email()
     if args.edit_zones:
         return app.edit_zones()
     return app.run(
