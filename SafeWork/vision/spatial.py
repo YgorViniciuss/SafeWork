@@ -27,6 +27,10 @@ class SpatialAnalyzer:
         self._zones = list(zones)
         self._regions = {PPE.HELMET: config.helmet_region, PPE.VEST: config.vest_region}
 
+    def update_zones(self, zones: Sequence[RiskZone]) -> None:
+        """Troca as zonas em uso (editor de ROI da GUI), sem reiniciar o pipeline."""
+        self._zones = list(zones)  # troca atômica da referência: seguro entre threads
+
     def analyze(
         self,
         detections: Iterable[Detection],

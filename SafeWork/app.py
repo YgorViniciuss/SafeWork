@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from pathlib import Path
 
 import cv2
@@ -11,36 +10,22 @@ import numpy as np
 
 from safework.audit import AuditRepository, EvidenceStore, ViolationAuditor
 from safework.core.config import Settings, resolve_path
-from safework.core.models import FrameAnalysis
-from safework.logic import (
-    AlertEngine,
-    AlertSnapshot,
-    AlertState,
-    EventBus,
-    EventType,
-    LoggingAlertListener,
-)
-from safework.notification import (
-    AlarmPlayer,
-    AlertOverlay,
-    EmailNotifier,
-    NullNotifier,
-    SilentBackend,
-    create_backend,
-)
-from safework.notification.sound import SoundBackend
+from safework.logic import EventBus, EventType, LoggingAlertListener
+from safework.monitoring import DetectorFactory, FrameUpdate, MonitoringService
+from safework.notification import EmailNotifier, NullNotifier
 from safework.vision.capture import VideoSource
 from safework.vision.detector import YoloDetector
-from safework.vision.pipeline import VisionPipeline
 from safework.vision.preprocessing import FramePreprocessor
-from safework.vision.renderer import FrameRenderer
 from safework.vision.roi import ZoneRepository
 from safework.vision.roi_editor import RoiEditor
-from safework.vision.spatial import SpatialAnalyzer
 
 logger = logging.getLogger(__name__)
 
 _EXIT_KEYS = (ord("q"), ord("Q"), 27)
+
+
+class GuiUnavailable(RuntimeError):
+    """A interface gráfica não pode ser aberta neste ambiente."""
 
 
 class SafeWorkApp:
@@ -76,10 +61,13 @@ class SafeWorkApp:
         # O resultado do envio volta para a auditoria (status enviado/falhou).
         return EmailNotifier(config, on_result=self.audit.update_email_status)
 
+    def audit_report(self) -> tuple[int, list[str]]:
+        """(total de registros, problemas encontrados). Usado pela GUI e pela CLI."""
+        return self.audit.count(), self.audit.verify()
+
     def verify_audit(self) -> int:
         """Confere a cadeia de hashes da auditoria e as imagens de evidência."""
-        problems = self.audit.verify()
-        total = self.audit.count()
+        total, problems = self.audit_report()
         if problems:
             for problem in problems:
                 logger.error("%s", problem)
@@ -113,6 +101,44 @@ class SafeWorkApp:
         RoiEditor(self._zones).run(preprocessor.process(frame.image))
         return 0
 
+    # ------------------------------------------------------------------ monitoramento
+    def create_service(
+        self,
+        mute: bool = False,
+        detector_factory: DetectorFactory = YoloDetector,
+    ) -> MonitoringService:
+        return MonitoringService(
+            settings=self._settings,
+            events=self.events,
+            audit=self.audit,
+            notifier=self.notifier,
+            zones=self._zones,
+            detector_factory=detector_factory,
+            mute=mute,
+        )
+
+    def run_gui(self, mute: bool = False) -> int:
+        """Abre o dashboard industrial (Módulo 4)."""
+        try:
+            from safework.gui import Dashboard
+        except ImportError as exc:  # Tkinter ou CustomTkinter ausentes
+            raise GuiUnavailable(f"interface gráfica indisponível ({exc})") from exc
+
+        service = self.create_service(mute)
+        try:
+            dashboard = Dashboard(
+                service=service,
+                zones=self._zones,
+                audit_check=self.audit_report,
+                camera=self._settings.camera,
+                title=self._settings.display.window_name,
+            )
+        except Exception as exc:  # ex.: sem display (TclError)
+            raise GuiUnavailable(f"não foi possível abrir a janela ({exc})") from exc
+        dashboard.start()
+        dashboard.mainloop()
+        return service.exit_code
+
     def run(
         self,
         headless: bool = False,
@@ -120,91 +146,31 @@ class SafeWorkApp:
         max_frames: int = 0,
         mute: bool = False,
     ) -> int:
-        """Executa o monitoramento até o usuário sair ou a fonte terminar."""
-        zones = self._zones.load()
-        if not zones:
-            logger.warning("Nenhuma zona de risco configurada. Use --edit-zones.")
-
-        settings = self._settings
-        # Módulo 1: visão computacional
-        pipeline = VisionPipeline(
-            preprocessor=FramePreprocessor(settings.preprocessing),
-            detector=YoloDetector(settings.detector),
-            analyzer=SpatialAnalyzer(settings.spatial, zones),
-            renderer=FrameRenderer(settings.camera, settings.display, zones),
-        )
-        # Módulo 2: máquina de estados, alertas visual e sonoro
-        engine = AlertEngine(settings.alerts)
-        overlay = AlertOverlay(settings.alerts)
-        alarm = AlarmPlayer(self._sound_backend(mute), settings.sound)
-
+        """Modo sem painel: janela OpenCV simples ou nenhuma janela (--headless)."""
+        service = self.create_service(mute)
         writer: cv2.VideoWriter | None = None
-        processed = 0
-        total_ms = 0.0
-        last_frame_at = time.monotonic()
-        source = VideoSource(settings.camera)
+        window = self._settings.display.window_name
+
+        def on_frame(update: FrameUpdate) -> bool:
+            nonlocal writer
+            if output:
+                writer = writer or self._create_writer(output, update.image)
+                writer.write(update.image)
+            if headless:
+                return True
+            cv2.imshow(window, update.image)
+            return not self._user_requested_exit()
+
+        def on_idle() -> bool:
+            return headless or not self._user_requested_exit()
+
         try:
-            with source, alarm, self.notifier:
-                logger.info("Alarme sonoro: %s.", alarm.backend_name)
-                for result in pipeline.stream(source):
-                    if result is None:
-                        # Sem frames (câmera caiu): não há como verificar ninguém.
-                        idle = time.monotonic() - last_frame_at
-                        if idle >= settings.alerts.lost_track_timeout_s and engine.active_tracks:
-                            self._publish(engine.expire_all(), None)
-                            alarm.set_level(AlertState.OK)
-                    else:
-                        last_frame_at = time.monotonic()
-                        processed += 1
-                        total_ms += result.inference_ms
-                        image = self._handle_alerts(result, engine, overlay, alarm)
-                        if output:
-                            writer = writer or self._create_writer(output, image)
-                            writer.write(image)
-                        if not headless:
-                            cv2.imshow(settings.display.window_name, image)
-                    if not headless and self._user_requested_exit():
-                        break
-                    if max_frames and processed >= max_frames:
-                        break
-        except KeyboardInterrupt:
-            logger.info("Interrompido pelo usuário.")
+            return service.run(on_frame, on_idle, max_frames)
         finally:
             if writer is not None:
                 writer.release()
             if not headless:
                 cv2.destroyAllWindows()
-
-        if processed:
-            logger.info(
-                "%d frame(s) processado(s). Inferência média: %.1f ms.",
-                processed,
-                total_ms / processed,
-            )
-        return 1 if source.error else 0
-
-    def _handle_alerts(
-        self,
-        result: FrameAnalysis,
-        engine: AlertEngine,
-        overlay: AlertOverlay,
-        alarm: AlarmPlayer,
-    ) -> np.ndarray:
-        """Etapa do Módulo 2 para um frame. Devolve a imagem final (também a evidência)."""
-        snapshot = engine.update(result)
-        image = overlay.draw(result.annotated_image, result.persons, snapshot)
-        alarm.set_level(snapshot.highest_state)
-        self._publish(snapshot, image)
-        return image
-
-    def _publish(self, snapshot: AlertSnapshot, image: np.ndarray | None) -> None:
-        for event in snapshot.events:
-            self.events.publish(event, image)
-
-    def _sound_backend(self, mute: bool) -> SoundBackend:
-        if mute or not self._settings.sound.enabled:
-            return SilentBackend()
-        return create_backend(self._settings.sound.backend)
 
     def _user_requested_exit(self) -> bool:
         key = cv2.waitKey(1) & 0xFF

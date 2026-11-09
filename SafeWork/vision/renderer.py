@@ -58,6 +58,9 @@ class FrameRenderer:
         self._display = display
         self._zones = list(zones)
 
+    def update_zones(self, zones: Sequence[RiskZone]) -> None:
+        self._zones = list(zones)
+
     def render(
         self,
         image: np.ndarray,

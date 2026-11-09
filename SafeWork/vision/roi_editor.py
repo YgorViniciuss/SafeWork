@@ -50,14 +50,18 @@ class ZoneEditorState:
     def clear_draft(self) -> None:
         self.draft.clear()
 
-    def close_polygon(self, required_ppe: frozenset[PPE]) -> RiskZone | None:
+    def close_polygon(
+        self,
+        required_ppe: frozenset[PPE],
+        name: str | None = None,
+    ) -> RiskZone | None:
         """Cria a zona com o rascunho atual. Devolve None se houver menos de 3 vértices."""
         if len(self.draft) < 3:
             return None
         number = self._next_number()
         zone = RiskZone(
             id=f"zona-{number}",
-            name=f"Zona {number}",
+            name=(name or "").strip() or f"Zona {number}",
             points=tuple(self.draft),
             required_ppe=required_ppe,
         )

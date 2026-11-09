@@ -128,6 +128,7 @@ class AlarmPlayer:
             AlertState.VIOLATION: config.violation_tone,
         }
         self._level = AlertState.OK
+        self._muted = False
         self._condition = threading.Condition()
         self._stopped = False
         self._thread: threading.Thread | None = None
@@ -162,6 +163,16 @@ class AlarmPlayer:
     def __exit__(self, *_: object) -> None:
         self.stop()
 
+    @property
+    def muted(self) -> bool:
+        return self._muted
+
+    def set_muted(self, muted: bool) -> None:
+        """Silencia o som. Os alertas visuais e a auditoria continuam normalmente."""
+        with self._condition:
+            self._muted = muted
+            self._condition.notify_all()
+
     def set_level(self, level: AlertState) -> None:
         if level is self._level:
             return
@@ -173,7 +184,8 @@ class AlarmPlayer:
         while True:
             with self._condition:
                 self._condition.wait_for(
-                    lambda: self._stopped or self._level is not AlertState.OK
+                    lambda: self._stopped
+                    or (self._level is not AlertState.OK and not self._muted)
                 )
                 if self._stopped:
                     return

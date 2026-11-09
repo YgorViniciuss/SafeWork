@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import replace
 
-from safework.core.models import Frame, FrameAnalysis
+from safework.core.models import Frame, FrameAnalysis, ObjectClass
 from safework.utils.fps import FpsMeter
 from safework.vision.capture import VideoSource
 from safework.vision.detector import Detector
 from safework.vision.preprocessing import FramePreprocessor
 from safework.vision.renderer import FrameRenderer
+from safework.vision.roi import RiskZone
 from safework.vision.spatial import SpatialAnalyzer
 
 
@@ -30,6 +31,15 @@ class VisionPipeline:
         self._analyzer = analyzer
         self._renderer = renderer
         self._fps = FpsMeter()
+
+    @property
+    def supported_classes(self) -> frozenset[ObjectClass]:
+        return self._detector.supported_classes
+
+    def update_zones(self, zones: Sequence[RiskZone]) -> None:
+        """Aplica novas zonas de risco à análise espacial e ao desenho."""
+        self._analyzer.update_zones(zones)
+        self._renderer.update_zones(zones)
 
     def process(self, frame: Frame) -> FrameAnalysis:
         """Executa todas as etapas para um frame."""
