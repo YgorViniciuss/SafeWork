@@ -1,0 +1,66 @@
+# ==============================================================================
+# SafeWork - Configuração central
+# Caminhos relativos são resolvidos a partir da raiz do projeto.
+# ==============================================================================
+
+camera:
+  # Fonte de vídeo:
+  #   0, 1, ...                             -> webcam local
+  #   "rtsp://usuario:senha@10.0.0.5/live"  -> câmera IP
+  #   "data/teste.mp4"                      -> arquivo de vídeo (homologação)
+  source: 0
+  id: "CAM-01"
+  name: "Câmera Prensa 01"
+  area: "Setor de Prensas"
+  reconnect_delay_s: 2.0        # espera inicial entre tentativas de reconexão
+  max_reconnect_delay_s: 30.0   # teto do backoff exponencial
+  max_reconnect_attempts: 0     # 0 = tenta para sempre
+
+preprocessing:
+  target_width: 960    # largura de trabalho; a proporção é preservada. 0 = não redimensiona
+  denoise: false       # filtro Gaussiano para câmeras com muito ruído
+  denoise_kernel: 3    # tamanho do kernel (ímpar)
+
+detector:
+  weights: "models/safework_ppe.pt"    # pesos customizados treinados no Roboflow
+  fallback_weights: "models/yolov8n.pt" # COCO: detecta apenas pessoas (modo demonstração)
+  confidence: 0.45
+  iou: 0.50
+  image_size: 640
+  device: null          # null = automático | "cpu" | 0 (primeira GPU)
+  tracking: true        # ByteTrack: IDs estáveis para o timer por operador (Módulo 2)
+  tracker: "bytetrack.yaml"
+  # O vínculo é feito pelo NOME da classe, pois a ordem varia entre datasets.
+  # A comparação ignora maiúsculas, "-" e "_". Classes como "NO-Hardhat" não casam.
+  class_aliases:
+    person: ["person", "pessoa", "operador", "operator", "worker"]
+    helmet: ["helmet", "hardhat", "hard hat", "capacete"]
+    vest: ["vest", "safety vest", "colete", "epi especifico"]
+
+spatial:
+  # Ponto do operador testado contra a ROI:
+  #   centroid      -> centro da caixa (definido na especificação)
+  #   bottom_center -> pés do operador (melhor para zonas marcadas no chão)
+  anchor: "centroid"
+  # Faixa vertical da caixa da pessoa onde o centro do EPI deve estar (0 = topo, 1 = base).
+  helmet_region: [0.0, 0.40]
+  vest_region: [0.15, 0.80]
+
+alerts:                     # Módulo 2 - máquina de estados
+  warning_seconds: 5.0      # tempo no Estado 1 até confirmar a infração (Estado 2)
+  clear_after_s: 1.0        # conformidade contínua exigida para voltar ao Estado 0
+  lost_track_timeout_s: 2.0 # operador que some por mais que isso é descartado
+  violation_repeat_s: 0.0   # 0 = um evento de violação por episódio; >0 = lembrete periódico
+  blink_hz: 2.0             # piscar vermelho/amarelo do Estado 1
+
+sound:
+  enabled: true
+  backend: "auto"           # auto | winsound | pygame | bell | none
+  warning_tone: [880, 200, 300]    # [Hz, duração ms, pausa ms] - Estado 1
+  violation_tone: [1320, 400, 100] # Estado 2
+
+zones_file: "config/zones.json"
+
+display:
+  window_name: "SafeWork - Monitoramento"
+  zone_opacity: 0.25

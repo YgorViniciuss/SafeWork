@@ -2,3 +2,7 @@
 *.vsidx
 __pycache__/
 venv/
+*.zip
+logs/
+evidences/*
+!evidences/.gitkeep

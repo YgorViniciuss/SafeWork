@@ -1,0 +1,7 @@
+ultralytics>=8.3,<9
+opencv-python>=4.9
+numpy>=1.26
+PyYAML>=6.0
+lap>=0.5        # associação usada pelo rastreador ByteTrack
+pygame>=2.5     # alarme sonoro (no Windows, o winsound já basta)
+pytest>=8.0     # apenas para os testes
