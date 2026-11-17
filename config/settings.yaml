@@ -12,23 +12,23 @@ camera:
   id: "CAM-01"
   name: "Câmera Prensa 01"
   area: "Setor de Prensas"
-  reconnect_delay_s: 2.0        # espera inicial entre tentativas de reconexão
-  max_reconnect_delay_s: 30.0   # teto do backoff exponencial
-  max_reconnect_attempts: 0     # 0 = tenta para sempre
+  reconnect_delay_s: 2.0 # espera inicial entre tentativas de reconexão
+  max_reconnect_delay_s: 30.0 # teto do backoff exponencial
+  max_reconnect_attempts: 0 # 0 = tenta para sempre
 
 preprocessing:
-  target_width: 960    # largura de trabalho; a proporção é preservada. 0 = não redimensiona
-  denoise: false       # filtro Gaussiano para câmeras com muito ruído
-  denoise_kernel: 3    # tamanho do kernel (ímpar)
+  target_width: 960 # largura de trabalho; a proporção é preservada. 0 = não redimensiona
+  denoise: false # filtro Gaussiano para câmeras com muito ruído
+  denoise_kernel: 3 # tamanho do kernel (ímpar)
 
 detector:
-  weights: "models/safework_ppe.pt"    # pesos customizados treinados no Roboflow
+  weights: "models/safework_ppe.pt" # pesos customizados treinados no Roboflow
   fallback_weights: "models/yolov8n.pt" # COCO: detecta apenas pessoas (modo demonstração)
-  confidence: 0.45
+  confidence: 0.25
   iou: 0.50
   image_size: 640
-  device: null          # null = automático | "cpu" | 0 (primeira GPU)
-  tracking: true        # ByteTrack: IDs estáveis para o timer por operador (Módulo 2)
+  device: null # null = automático | "cpu" | 0 (primeira GPU)
+  tracking: true # ByteTrack: IDs estáveis para o timer por operador (Módulo 2)
   tracker: "bytetrack.yaml"
   # O vínculo é feito pelo NOME da classe, pois a ordem varia entre datasets.
   # A comparação ignora maiúsculas, "-" e "_". Classes como "NO-Hardhat" não casam.
@@ -46,31 +46,31 @@ spatial:
   helmet_region: [0.0, 0.40]
   vest_region: [0.15, 0.80]
 
-alerts:                     # Módulo 2 - máquina de estados
-  warning_seconds: 5.0      # tempo no Estado 1 até confirmar a infração (Estado 2)
-  clear_after_s: 1.0        # conformidade contínua exigida para voltar ao Estado 0
+alerts: # Módulo 2 - máquina de estados
+  warning_seconds: 5.0 # tempo no Estado 1 até confirmar a infração (Estado 2)
+  clear_after_s: 1.0 # conformidade contínua exigida para voltar ao Estado 0
   lost_track_timeout_s: 2.0 # operador que some por mais que isso é descartado
-  violation_repeat_s: 0.0   # 0 = um evento de violação por episódio; >0 = lembrete periódico
-  blink_hz: 2.0             # piscar vermelho/amarelo do Estado 1
+  violation_repeat_s: 0.0 # 0 = um evento de violação por episódio; >0 = lembrete periódico
+  blink_hz: 2.0 # piscar vermelho/amarelo do Estado 1
 
 sound:
   enabled: true
-  backend: "auto"           # auto | winsound | pygame | bell | none
-  warning_tone: [880, 200, 300]    # [Hz, duração ms, pausa ms] - Estado 1
+  backend: "auto" # auto | winsound | pygame | bell | none
+  warning_tone: [880, 200, 300] # [Hz, duração ms, pausa ms] - Estado 1
   violation_tone: [1320, 400, 100] # Estado 2
 
-evidence:                   # Módulo 3 - prints de evidência
+evidence: # Módulo 3 - prints de evidência
   directory: "evidences"
-  jpeg_quality: 95          # a resolução é a de processamento (preprocessing.target_width)
+  jpeg_quality: 95 # a resolução é a de processamento (preprocessing.target_width)
 
 audit:
-  database: "data/safework_audit.db"   # trilha de auditoria SQLite
+  database: "data/safework_audit.db" # trilha de auditoria SQLite
 
-email:                      # Módulo 3 - notificação SMTP assíncrona
-  enabled: false            # ative depois de preencher os dados abaixo
+email: # Módulo 3 - notificação SMTP assíncrona
+  enabled: false # ative depois de preencher os dados abaixo
   host: "smtp.gmail.com"
   port: 587
-  security: "starttls"      # starttls (porta 587) | ssl (porta 465) | none (teste local)
+  security: "starttls" # starttls (porta 587) | ssl (porta 465) | none (teste local)
   username: "safework.alertas@gmail.com"
   # Prefira a variável de ambiente SAFEWORK_SMTP_PASSWORD: ela tem prioridade e
   # evita que a senha vá para o GitHub. No Gmail, use uma "senha de app".
@@ -80,10 +80,10 @@ email:                      # Módulo 3 - notificação SMTP assíncrona
   recipients:
     - "tecnico.seguranca@empresa.com.br"
   timeout_s: 15
-  max_retries: 3            # tentativas por e-mail
-  retry_delay_s: 5          # espera inicial entre tentativas (dobra a cada falha)
+  max_retries: 3 # tentativas por e-mail
+  retry_delay_s: 5 # espera inicial entre tentativas (dobra a cada falha)
   queue_size: 100
-  shutdown_timeout_s: 10    # ao encerrar, aguarda até isto para enviar pendências
+  shutdown_timeout_s: 10 # ao encerrar, aguarda até isto para enviar pendências
 
 zones_file: "config/zones.json"
 
