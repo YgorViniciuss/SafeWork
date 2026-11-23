@@ -10,15 +10,19 @@ from __future__ import annotations
 
 import csv
 import html
+import io
 import json
 import logging
+import math
 import os
 import sqlite3
+import struct
 import subprocess
 import sys
 import threading
 import time
 import unicodedata
+import wave
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -59,16 +63,16 @@ CUSTOM_EPI_IMG_DIR = DATA_DIR / "custom_epis"
 SETTINGS_PATH = CONFIG_DIR / "settings.yaml"
 ZONES_PATH = CONFIG_DIR / "zones.json"
 CUSTOM_EPIS_PATH = CONFIG_DIR / "custom_epis.json"
+CAMERA_RULES_PATH = CONFIG_DIR / "camera_rules.json"
 DB_PATH = DATA_DIR / "safework_audit.db"
 CSV_PATH = LOGS_DIR / "relatorio_auditoria.csv"
 HTML_PATH = LOGS_DIR / "relatorio_auditoria.html"
 
 APP_TITLE = "SafeWork - Identificação e Mitigação de Riscos de Acidentes de Trabalho"
 
-# Geometria 100% fixa
 WIN_W, WIN_H = 1366, 768
-LEFT_W = 886                 # ~65% da largura
-RIGHT_W = WIN_W - LEFT_W     # 480 (~35%)
+LEFT_W = 886
+RIGHT_W = WIN_W - LEFT_W
 VIDEO_W, VIDEO_H = 840, 520
 
 STATE_REGULAR = "REGULAR"
@@ -86,7 +90,7 @@ C = {
     "cyan": "#00D8F6",
     "text": "#E6F1FF",
     "muted": "#8FA8C4",
-    "green": "#22C55E",
+    "green": "#22C5E5",
     "green_bg": "#0E3B2A",
     "red": "#EF4444",
     "red_bg": "#4A1414",
@@ -94,8 +98,8 @@ C = {
     "gray_bg": "#1C2B3F",
     "amber": "#F59E0B",
 }
+C["green"] = "#22C55E"
 
-# Cores OpenCV (BGR)
 BGR_GREEN = (80, 200, 60)
 BGR_RED = (68, 68, 239)
 BGR_CYAN = (246, 216, 0)
@@ -106,6 +110,46 @@ BGR_BLACK = (0, 0, 0)
 FONT_FAMILY = "Segoe UI" if os.name == "nt" else "Helvetica"
 
 log = logging.getLogger("safework")
+
+
+# ======================================================================
+# DETECTOR FACIAL NATIVO (ANCORAGEM ANATOMICA REAL)
+# ======================================================================
+_FACE_CASCADE: Optional[cv2.CascadeClassifier] = None
+
+
+def _get_face_cascade() -> Optional[cv2.CascadeClassifier]:
+    global _FACE_CASCADE
+    if _FACE_CASCADE is None:
+        try:
+            xml_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            clf = cv2.CascadeClassifier(xml_path)
+            if not clf.empty():
+                _FACE_CASCADE = clf
+        except Exception:
+            pass
+    return _FACE_CASCADE
+
+
+def locate_face_in_person(frame: np.ndarray, person_box: tuple[float, float, float, float]) -> Optional[tuple[int, int, int, int]]:
+    """Localiza o rosto real dentro da caixa do operador para ancorar olhos, boca e topo da cabeca."""
+    clf = _get_face_cascade()
+    if clf is None:
+        return None
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = (max(0, int(person_box[0])), max(0, int(person_box[1])),
+                      min(w, int(person_box[2])), min(h, int(person_box[3])))
+    ph = y2 - y1
+    pw = x2 - x1
+    if pw < 30 or ph < 30:
+        return None
+    search_y2 = min(h, y1 + int(ph * 0.65))
+    roi_gray = cv2.cvtColor(frame[y1:search_y2, x1:x2], cv2.COLOR_BGR2GRAY)
+    faces = clf.detectMultiScale(roi_gray, scaleFactor=1.15, minNeighbors=4, minSize=(36, 36))
+    if len(faces) == 0:
+        return None
+    fx, fy, fw, fh = max(faces, key=lambda r: r[2] * r[3])
+    return (x1 + int(fx), y1 + int(fy), x1 + int(fx + fw), y1 + int(fy + fh))
 
 
 # ======================================================================
@@ -137,12 +181,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "detection": {
         "conf_person": 0.25,
-        "conf_ear": 0.08,       # Limiar otimizado para capturar conchas laterais em close-up
-        "conf_glasses": 0.10,   # Limiar otimizado para lentes transparentes
+        "conf_ear": 0.08,
+        "conf_glasses": 0.10,
         "iou": 0.45,
         "required_ppe": ["ear", "glasses"],
-        "window": 10,
-        "needed": 7,
+        "window": 6,
+        "needed": 4,
         "class_map": {
             "helmet": "ear",
             "glasses": "glasses",
@@ -152,7 +196,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         },
     },
     "alert": {
-        "infraction_seconds": 5.0,
+        "infraction_seconds": 3.0,
         "cooldown_seconds": 15.0,
         "beep_freq": 1200,
         "beep_ms": 350,
@@ -210,7 +254,6 @@ def load_settings() -> dict[str, Any]:
         default_map = DEFAULT_SETTINGS["detection"]["class_map"]
         user_map = merged["detection"].get("class_map") or {}
         merged["detection"]["class_map"] = {**default_map, **user_map}
-        # Forca limiares baixos para garantir leitura de fone e oculos
         merged["detection"]["conf_ear"] = min(float(merged["detection"].get("conf_ear", 0.08)), 0.10)
         merged["detection"]["conf_glasses"] = min(float(merged["detection"].get("conf_glasses", 0.10)), 0.12)
         return merged
@@ -234,23 +277,95 @@ def open_path(path: Path | str) -> None:
         subprocess.Popen(["xdg-open", target])
 
 
-def play_alert(freq: int = 1200, ms: int = 350, count: int = 3) -> None:
-    def _run() -> None:
-        try:
+# ======================================================================
+# SIRENE PROGRESSIVA INTELIGENTE (PARA IMEDIATAMENTE AO REGULARIZAR)
+# ======================================================================
+def _build_siren_wav(level: int) -> bytes:
+    sample_rate = 22050
+    duration = 0.55
+    n_samples = int(sample_rate * duration)
+    amp = min(1.0, 0.35 + level * 0.12) * 32767.0
+    f_start = 880.0 + min(level, 6) * 110.0
+    f_end = f_start + 520.0
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        frames = bytearray()
+        for i in range(n_samples):
+            t = i / sample_rate
+            progress = i / n_samples
+            freq = f_start + (f_end - f_start) * progress
+            val = 0.75 * math.sin(2.0 * math.pi * freq * t) + 0.25 * math.sin(4.0 * math.pi * freq * t)
+            sample = int(max(-32767, min(32767, val * amp)))
+            frames.extend(struct.pack("<h", sample))
+        wf.writeframes(bytes(frames))
+    return buf.getvalue()
+
+
+class ProgressiveSiren:
+    def __init__(self) -> None:
+        self._active = threading.Event()
+        self._halt = threading.Event()
+        self._start_time = 0.0
+        self._lock = threading.Lock()
+        self._wav_cache: dict[int, bytes] = {lvl: _build_siren_wav(lvl) for lvl in range(7)}
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="progressive-siren")
+        self._thread.start()
+
+    def start_alarm(self) -> None:
+        with self._lock:
+            if not self._active.is_set():
+                self._start_time = time.monotonic()
+                self._active.set()
+
+    def stop_alarm(self) -> None:
+        with self._lock:
+            if self._active.is_set():
+                self._active.clear()
+                if winsound is not None:
+                    try:
+                        winsound.PlaySound(None, winsound.SND_PURGE)
+                    except Exception:
+                        pass
+
+    def shutdown(self) -> None:
+        self.stop_alarm()
+        self._halt.set()
+
+    def _loop(self) -> None:
+        while not self._halt.is_set():
+            if not self._active.is_set():
+                time.sleep(0.05)
+                continue
+
+            with self._lock:
+                if not self._active.is_set():
+                    continue
+                elapsed = max(0.0, time.monotonic() - self._start_time)
+
+            level = min(6, int(elapsed // 1.2))
             if winsound is not None:
-                for _ in range(max(1, count)):
-                    winsound.Beep(int(freq), int(ms))
-                    time.sleep(0.05)
+                try:
+                    wav_bytes = self._wav_cache[level]
+                    winsound.PlaySound(wav_bytes, winsound.SND_MEMORY | winsound.SND_ASYNC)
+                    for _ in range(11):
+                        if not self._active.is_set() or self._halt.is_set():
+                            winsound.PlaySound(None, winsound.SND_PURGE)
+                            break
+                        time.sleep(0.05)
+                except Exception:
+                    log.exception("Erro ao reproduzir sirene WAV.")
+                    time.sleep(0.2)
             else:
                 print("\a", end="", flush=True)
-        except Exception:
-            log.exception("Falha ao tocar alerta sonoro.")
-
-    threading.Thread(target=_run, daemon=True, name="alert-beep").start()
+                time.sleep(0.4)
 
 
 # ======================================================================
-# GERENCIADOR DE EPIS CUSTOMIZADOS (TREINAMENTO POR FOTOS / ASSINATURA VISUAL)
+# GERENCIADOR DE EPIS CUSTOMIZADOS E ANATOMIA DE DETECCAO
 # ======================================================================
 def _imread_unicode(path: Path | str) -> Optional[np.ndarray]:
     try:
@@ -262,19 +377,85 @@ def _imread_unicode(path: Path | str) -> Optional[np.ndarray]:
         return None
 
 
-def extract_visual_signature(img_bgr: np.ndarray) -> list[float]:
-    """Extrai assinatura normalizada HSV (Matiz x Saturacao) do recorte central do EPI."""
-    h, w = img_bgr.shape[:2]
-    # Usa o centro (60%) da imagem de referencia para evitar fundo
-    y1, y2 = int(h * 0.2), int(h * 0.8)
-    x1, x2 = int(w * 0.2), int(w * 0.8)
-    crop = img_bgr[max(0, y1):max(1, y2), max(0, x1):max(1, x2)]
-    if crop.size == 0:
-        crop = img_bgr
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv], [0, 1], None, [18, 16], [0, 180, 0, 256])
-    cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
-    return hist.flatten().tolist()
+def _skin_weight_mask(bgr: np.ndarray) -> np.ndarray:
+    """Atenua pixels de tom de pele humana para que a assinatura foque no material do EPI."""
+    ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+    skin = cv2.inRange(ycrcb, np.array([0, 133, 77]), np.array([255, 173, 127]))
+    return np.where(skin > 0, 35, 255).astype(np.uint8)
+
+
+def extract_visual_signature(crop_bgr: np.ndarray) -> dict[str, Any]:
+    """Extrai assinatura focada no material do EPI (atenuando pele) + densidade estrutural e gradiente."""
+    if crop_bgr is None or crop_bgr.size == 0:
+        return {}
+    resized = cv2.resize(crop_bgr, (96, 96), interpolation=cv2.INTER_AREA)
+    non_skin_mask = _skin_weight_mask(resized)
+
+    hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
+    hist_hsv = cv2.calcHist([hsv], [0, 1, 2], non_skin_mask, [12, 8, 8], [0, 180, 0, 256, 0, 256])
+    cv2.normalize(hist_hsv, hist_hsv, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+
+    lab = cv2.cvtColor(resized, cv2.COLOR_BGR2LAB)
+    hist_lab = cv2.calcHist([lab], [0, 1, 2], non_skin_mask, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+    cv2.normalize(hist_lab, hist_lab, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 130)
+    edge_density = float(cv2.countNonZero(edges)) / max(1, edges.size)
+
+    sobelx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad_energy = float(np.mean(cv2.magnitude(sobelx, sobely)))
+
+    struct_small = cv2.resize(edges, (16, 16), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+
+    return {
+        "hist_hsv": hist_hsv.flatten().tolist(),
+        "hist_lab": hist_lab.flatten().tolist(),
+        "edge_density": round(edge_density, 4),
+        "grad_energy": round(grad_energy, 2),
+        "struct_map": struct_small.flatten().tolist(),
+    }
+
+
+def _compare_roi_with_sig(roi: np.ndarray, sig: dict[str, Any]) -> float:
+    non_skin_mask = _skin_weight_mask(roi)
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    roi_hsv = cv2.calcHist([hsv], [0, 1, 2], non_skin_mask, [12, 8, 8], [0, 180, 0, 256, 0, 256])
+    cv2.normalize(roi_hsv, roi_hsv, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+
+    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+    roi_lab = cv2.calcHist([lab], [0, 1, 2], non_skin_mask, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+    cv2.normalize(roi_lab, roi_lab, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 130)
+    roi_edges = float(cv2.countNonZero(edges)) / max(1, edges.size)
+
+    sobelx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    roi_grad = float(np.mean(cv2.magnitude(sobelx, sobely)))
+
+    ref_hsv = np.array(sig["hist_hsv"], dtype=np.float32).reshape((12, 8, 8))
+    ref_lab = np.array(sig["hist_lab"], dtype=np.float32).reshape((8, 8, 8))
+    ref_edge = float(sig.get("edge_density", roi_edges))
+    ref_grad = float(sig.get("grad_energy", roi_grad))
+
+    sim_hsv = max(0.0, float(cv2.compareHist(roi_hsv, ref_hsv, cv2.HISTCMP_CORREL)))
+    sim_lab = max(0.0, float(cv2.compareHist(roi_lab, ref_lab, cv2.HISTCMP_CORREL)))
+    sim_edge = max(0.0, 1.0 - abs(roi_edges - ref_edge) * 3.5)
+    sim_grad = max(0.0, 1.0 - abs(roi_grad - ref_grad) / max(25.0, ref_grad))
+
+    sim_struct = 0.5
+    if "struct_map" in sig:
+        roi_struct = cv2.resize(edges, (16, 16), interpolation=cv2.INTER_AREA).astype(np.float32).flatten() / 255.0
+        ref_struct = np.array(sig["struct_map"], dtype=np.float32)
+        denom = float(np.linalg.norm(roi_struct) * np.linalg.norm(ref_struct))
+        if denom > 1e-5:
+            sim_struct = max(0.0, float(np.dot(roi_struct, ref_struct) / denom))
+
+    return sim_lab * 0.25 + sim_hsv * 0.20 + sim_edge * 0.20 + sim_grad * 0.15 + sim_struct * 0.20
 
 
 def load_custom_epis() -> list[dict[str, Any]]:
@@ -293,24 +474,75 @@ def save_custom_epis(epis: list[dict[str, Any]]) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     tmp = CUSTOM_EPIS_PATH.with_suffix(".json.tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({"version": 1, "epis": epis}, fh, ensure_ascii=False, indent=2)
+        json.dump({"version": 4, "epis": epis}, fh, ensure_ascii=False, indent=2)
     os.replace(tmp, CUSTOM_EPIS_PATH)
 
 
-def get_roi_for_region(person_box: tuple[float, float, float, float], region: str, frame_w: int, frame_h: int) -> tuple[int, int, int, int]:
-    """Calcula a sub-regiao anatomica dentro da caixa do operador."""
+def load_camera_rules() -> dict[str, list[str]]:
+    if not CAMERA_RULES_PATH.exists():
+        return {}
+    try:
+        with open(CAMERA_RULES_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        rules = data.get("rules", {}) if isinstance(data, dict) else {}
+        return {str(k): list(v) for k, v in rules.items() if isinstance(v, list)}
+    except Exception:
+        log.exception("Erro ao ler camera_rules.json")
+        return {}
+
+
+def save_camera_rules(rules: dict[str, list[str]]) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CAMERA_RULES_PATH.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"version": 1, "rules": rules}, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, CAMERA_RULES_PATH)
+
+
+def get_roi_for_region(
+    frame: np.ndarray,
+    person_box: tuple[float, float, float, float],
+    region: str,
+    face_box: Optional[tuple[int, int, int, int]] = None,
+) -> tuple[int, int, int, int]:
+    """Segmentacao anatomica ancorada no rosto real quando detectado, com fallback proporcional."""
+    frame_h, frame_w = frame.shape[:2]
     x1, y1, x2, y2 = person_box
     pw = max(1.0, x2 - x1)
     ph = max(1.0, y2 - y1)
-    if region == "face":       # Mascara de solda / respirador / viseira
-        rx1, ry1 = x1 + pw * 0.20, y1 + ph * 0.15
-        rx2, ry2 = x2 - pw * 0.20, y1 + ph * 0.65
-    elif region == "head":     # Capacete / protetor auricular
-        rx1, ry1 = x1 + pw * 0.05, y1
-        rx2, ry2 = x2 - pw * 0.05, y1 + ph * 0.50
-    else:                      # Tronco / Avental / Colete
-        rx1, ry1 = x1 + pw * 0.10, y1 + ph * 0.40
-        rx2, ry2 = x2 - pw * 0.10, y2
+
+    if face_box is not None:
+        fx1, fy1, fx2, fy2 = face_box
+        fw = max(1.0, float(fx2 - fx1))
+        fh = max(1.0, float(fy2 - fy1))
+        if region == "eyes":
+            rx1, ry1 = fx1 + fw * 0.08, fy1 + fh * 0.22
+            rx2, ry2 = fx2 - fw * 0.08, fy1 + fh * 0.50
+        elif region == "mouth":
+            rx1, ry1 = fx1 + fw * 0.10, fy1 + fh * 0.48
+            rx2, ry2 = fx2 - fw * 0.10, fy2 + fh * 0.08
+        elif region == "head":
+            rx1, ry1 = max(x1, fx1 - fw * 0.28), max(y1, fy1 - fh * 0.65)
+            rx2, ry2 = min(x2, fx2 + fw * 0.28), fy1 + fh * 0.35
+        else:
+            rx1, ry1 = x1 + pw * 0.10, min(y2 - 10, fy2 + fh * 0.15)
+            rx2, ry2 = x2 - pw * 0.10, y2
+    else:
+        aspect = ph / pw
+        is_closeup = aspect < 1.75
+        if region == "eyes":
+            rx1, ry1 = x1 + pw * 0.24, y1 + ph * (0.22 if is_closeup else 0.14)
+            rx2, ry2 = x2 - pw * 0.24, y1 + ph * (0.38 if is_closeup else 0.28)
+        elif region == "mouth":
+            rx1, ry1 = x1 + pw * 0.24, y1 + ph * (0.34 if is_closeup else 0.22)
+            rx2, ry2 = x2 - pw * 0.24, y1 + ph * (0.62 if is_closeup else 0.42)
+        elif region == "head":
+            rx1, ry1 = x1 + pw * 0.12, y1
+            rx2, ry2 = x2 - pw * 0.12, y1 + ph * (0.32 if is_closeup else 0.24)
+        else:
+            rx1, ry1 = x1 + pw * 0.10, y1 + ph * 0.45
+            rx2, ry2 = x2 - pw * 0.10, y2
+
     return (
         max(0, min(frame_w - 1, int(rx1))),
         max(0, min(frame_h - 1, int(ry1))),
@@ -319,72 +551,73 @@ def get_roi_for_region(person_box: tuple[float, float, float, float], region: st
     )
 
 
-def match_custom_epi(frame: np.ndarray, person_box: tuple[float, float, float, float], epi: dict[str, Any]) -> Optional[tuple[float, tuple[float, float, float, float]]]:
-    """Compara a assinatura visual das fotos cadastradas com a regiao esperada no operador."""
+def match_custom_epi(
+    frame: np.ndarray,
+    person_box: tuple[float, float, float, float],
+    epi: dict[str, Any],
+    face_box: Optional[tuple[int, int, int, int]] = None,
+) -> Optional[tuple[float, tuple[float, float, float, float]]]:
     signatures = epi.get("signatures") or []
     if not signatures:
         return None
-    h, w = frame.shape[:2]
-    rx1, ry1, rx2, ry2 = get_roi_for_region(person_box, epi.get("region", "face"), w, h)
+    rx1, ry1, rx2, ry2 = get_roi_for_region(frame, person_box, epi.get("region", "mouth"), face_box)
     if rx2 - rx1 < 12 or ry2 - ry1 < 12:
         return None
-    roi = frame[ry1:ry2, rx1:rx2]
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    roi_hist = cv2.calcHist([hsv], [0, 1], None, [18, 16], [0, 180, 0, 256])
-    cv2.normalize(roi_hist, roi_hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+    roi = cv2.resize(frame[ry1:ry2, rx1:rx2], (96, 96), interpolation=cv2.INTER_AREA)
 
-    best_score = 0.0
-    for sig in signatures:
-        ref_hist = np.array(sig, dtype=np.float32).reshape((18, 16))
-        score = float(cv2.compareHist(roi_hist, ref_hist, cv2.HISTCMP_CORREL))
-        if score > best_score:
-            best_score = score
+    pos_scores = [_compare_roi_with_sig(roi, s) for s in signatures if isinstance(s, dict) and "hist_lab" in s]
+    if not pos_scores:
+        return None
+    best_pos = max(pos_scores)
 
-    threshold = float(epi.get("threshold", 0.58))
-    if best_score >= threshold:
-        return best_score, (float(rx1), float(ry1), float(rx2), float(ry2))
+    neg_sigs = epi.get("negative_signatures") or []
+    neg_scores = [_compare_roi_with_sig(roi, s) for s in neg_sigs if isinstance(s, dict) and "hist_lab" in s]
+    if neg_scores:
+        best_neg = max(neg_scores)
+        if best_pos <= best_neg + 0.04:
+            return None
+
+    threshold = max(0.62, float(epi.get("threshold", 0.64)))
+    if best_pos >= threshold:
+        return min(0.98, best_pos), (float(rx1), float(ry1), float(rx2), float(ry2))
     return None
 
 
 def detect_red_earmuffs_visual(frame: np.ndarray, person_box: tuple[float, float, float, float]) -> Optional[tuple[float, tuple[float, float, float, float]]]:
-    """Reforco visual especifico para protetor auricular tipo concha vermelho nas laterais da cabeca."""
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = person_box
     pw = max(1.0, x2 - x1)
     ph = max(1.0, y2 - y1)
 
-    # Regiao superior onde fica a cabeca (topo ate 55% da caixa)
-    hy1 = max(0, int(y1 + ph * 0.05))
-    hy2 = min(h, int(y1 + ph * 0.58))
+    hy1 = max(0, int(y1 + ph * 0.04))
+    hy2 = min(h, int(y1 + ph * 0.56))
     hx1 = max(0, int(x1))
     hx2 = min(w, int(x2))
-    if hy2 - hy1 < 20 or hx2 - hx1 < 20:
+    if hy2 - hy1 < 18 or hx2 - hx1 < 18:
         return None
 
     head_roi = frame[hy1:hy2, hx1:hx2]
     hsv = cv2.cvtColor(head_roi, cv2.COLOR_BGR2HSV)
 
-    # Mascara de vermelho industrial (faixas H: 0..10 e 168..180 com boa saturacao)
-    mask1 = cv2.inRange(hsv, np.array([0, 95, 55]), np.array([10, 255, 255]))
-    mask2 = cv2.inRange(hsv, np.array([168, 95, 55]), np.array([180, 255, 255]))
+    mask1 = cv2.inRange(hsv, np.array([0, 75, 40]), np.array([12, 255, 255]))
+    mask2 = cv2.inRange(hsv, np.array([165, 75, 40]), np.array([180, 255, 255]))
     mask = cv2.bitwise_or(mask1, mask2)
 
-    # Zera o miolo central do rosto (35% a 65% da largura) para nao confundir labios/pele com fone
     rw = hx2 - hx1
-    mask[:, int(rw * 0.32):int(rw * 0.68)] = 0
+    mask[:, int(rw * 0.34):int(rw * 0.66)] = 0
 
     red_pixels = int(cv2.countNonZero(mask))
-    side_area = max(1, (hy2 - hy1) * int(rw * 0.64))
+    side_area = max(1, (hy2 - hy1) * int(rw * 0.68))
     ratio = red_pixels / side_area
 
-    if ratio >= 0.045:
+    if ratio >= 0.032:
         ys, xs = np.where(mask > 0)
         if xs.size > 0:
             bx1 = float(hx1 + int(xs.min()))
             by1 = float(hy1 + int(ys.min()))
             bx2 = float(hx1 + int(xs.max()))
             by2 = float(hy1 + int(ys.max()))
-            conf = min(0.95, 0.55 + ratio * 2.5)
+            conf = min(0.95, 0.58 + ratio * 2.8)
             return conf, (bx1, by1, bx2, by2)
     return None
 
@@ -466,7 +699,7 @@ def _predict_kwargs(settings: dict[str, Any]) -> dict[str, Any]:
 
 
 # ======================================================================
-# GEOMETRIA / REGRAS DE DECISAO (puro, sem GUI)
+# GEOMETRIA / REGRAS DE DECISAO
 # ======================================================================
 @dataclass
 class Detection:
@@ -526,11 +759,11 @@ def box_in_zone(box: tuple[float, float, float, float], zone_polys: list[np.ndar
 
 
 def evaluate_frame(dets: list[Detection], zone_polys: list[np.ndarray], required: list[str]) -> FrameEval:
-    """Regra estrita X x Y: Operador (X) na area + EPI (Y) ausente => INFRACAO."""
     ev = FrameEval()
+    req_set = set(required)
     persons = [d for d in dets if d.role == "person"]
-    ppes = [d for d in dets if d.role not in ("person", "no_ear", "no_glasses")]
-    neg_ppes = [d for d in dets if d.role in ("no_ear", "no_glasses")]
+    ppes = [d for d in dets if d.role not in ("person", "no_ear", "no_glasses") and d.role in req_set]
+    neg_ppes = [d for d in dets if (d.role == "no_ear" and "ear" in req_set) or (d.role == "no_glasses" and "glasses" in req_set)]
 
     for p in persons:
         (ev.persons if box_in_zone(p.box, zone_polys) else ev.outside).append(p)
@@ -547,20 +780,23 @@ def evaluate_frame(dets: list[Detection], zone_polys: list[np.ndarray], required
         holders = [p for p in ev.persons if _point_in_box(cx, cy, p.box)]
         if holders:
             holder = min(holders, key=lambda p: _area(p.box))
+            if item.role == "glasses":
+                ph = max(1.0, holder.box[3] - holder.box[1])
+                rel_y = (cy - holder.box[1]) / ph
+                if rel_y < 0.11:
+                    continue
             present[id(holder)].add(item.role)
             ev.attached_ppe.append(item)
 
     for p in ev.persons:
-        ev.missing |= set(required) - present[id(p)]
+        ev.missing |= req_set - present[id(p)]
 
     ev.raw_state = STATE_INFRACAO if ev.missing else STATE_REGULAR
     return ev
 
 
 class TemporalFilter:
-    """Janela deslizante: so muda de estado se a condicao ocupar >= `needed` de `window` quadros."""
-
-    def __init__(self, window: int = 10, needed: int = 7, initial: str = STATE_REGULAR) -> None:
+    def __init__(self, window: int = 6, needed: int = 4, initial: str = STATE_REGULAR) -> None:
         self.window = window
         self.needed = needed
         self.state = initial
@@ -849,7 +1085,7 @@ class AuditStore:
 
 
 # ======================================================================
-# CAPTURA DE CAMERA (thread)
+# CAPTURA DE CAMERA
 # ======================================================================
 class CameraSource(threading.Thread):
     def __init__(self, cameras: list[dict[str, Any]], capture_cfg: dict[str, Any], start_index: int = 0) -> None:
@@ -904,18 +1140,33 @@ class CameraSource(threading.Thread):
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(self.cfg.get("width", 1280)))
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(self.cfg.get("height", 720)))
         else:
-            path = resolve_path(str(src))
-            target = str(path) if path.exists() else str(src)
-            cap = cv2.VideoCapture(target)
+            raw_str = str(src).strip()
+            path = resolve_path(raw_str)
             is_file = path.exists()
-            if is_file and cap.isOpened():
-                fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-                delay = 1.0 / max(1.0, fps)
+            target = str(path) if is_file else raw_str
+
+            if target.lower().startswith("rtsp://"):
+                for transport in ("tcp", "udp"):
+                    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{transport}|stimeout;5000000"
+                    cap = cv2.VideoCapture(target, cv2.CAP_FFMPEG)
+                    if cap.isOpened():
+                        ok, _ = cap.read()
+                        if ok:
+                            break
+                    if cap is not None:
+                        cap.release()
+                        cap = None
+            else:
+                cap = cv2.VideoCapture(target)
+                if is_file and cap.isOpened():
+                    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                    delay = 1.0 / max(1.0, fps)
 
         if cap is None or not cap.isOpened():
             if cap is not None:
                 cap.release()
             return None, False, 0.0
+
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         ok, _ = cap.read()
         if not ok:
@@ -962,7 +1213,7 @@ class CameraSource(threading.Thread):
                     if self._activate(req):
                         self.message = ""
                     else:
-                        self.message = f"Falha ao abrir {name}. Mantendo {self.cameras[self.active_index]['name']}."
+                        self.message = f"Falha ao abrir {name}. Verifique a URL/rede no settings.yaml."
                     continue
 
                 if self._cap is None:
@@ -986,7 +1237,7 @@ class CameraSource(threading.Thread):
                     self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     time.sleep(0.01)
                 else:
-                    if time.monotonic() - self._last_ok > 2.0:
+                    if time.monotonic() - self._last_ok > 3.0:
                         self.signal_ok = False
                         self._release()
                         self._last_try = time.monotonic()
@@ -1002,8 +1253,9 @@ class CameraSource(threading.Thread):
 # MOTOR DE DETECCAO E REGRAS (thread)
 # ======================================================================
 class RuntimeContext:
-    def __init__(self, camera_name: str, profile: str = "Operador") -> None:
+    def __init__(self, camera_name: str, camera_key: str, profile: str = "Operador") -> None:
         self.camera_name = camera_name
+        self.camera_key = camera_key
         self.profile = profile
 
 
@@ -1016,11 +1268,12 @@ class Snapshot:
     elapsed: float = 0.0
     registered: bool = False
     zones: int = 0
+    active_epis_text: str = ""
 
 
 class SafetyEngine(threading.Thread):
     def __init__(self, ppe_model, person_model, roles: dict[int, str], settings: dict[str, Any],
-                 cam: CameraSource, store: AuditStore, ctx: RuntimeContext) -> None:
+                 cam: CameraSource, store: AuditStore, ctx: RuntimeContext, siren: ProgressiveSiren) -> None:
         super().__init__(daemon=True, name="engine")
         det = settings["detection"]
         alert = settings["alert"]
@@ -1030,6 +1283,7 @@ class SafetyEngine(threading.Thread):
         self.cam = cam
         self.store = store
         self.ctx = ctx
+        self.siren = siren
         self.base_required: list[str] = list(det["required_ppe"])
         self.thresholds = {
             "person": float(det["conf_person"]),
@@ -1050,6 +1304,7 @@ class SafetyEngine(threading.Thread):
         self._halt = threading.Event()
         self._zones_norm: list[list[list[float]]] = []
         self._custom_epis: list[dict[str, Any]] = load_custom_epis()
+        self._camera_rules: dict[str, list[str]] = load_camera_rules()
         self._cfg_lock = threading.Lock()
         self._out_lock = threading.Lock()
         self._out_frame: Optional[np.ndarray] = None
@@ -1066,21 +1321,32 @@ class SafetyEngine(threading.Thread):
         with self._cfg_lock:
             self._zones_norm = [list(map(list, poly)) for poly in zones_norm]
 
-    def reload_custom_epis(self, epis: list[dict[str, Any]]) -> None:
+    def reload_ppe_config(self, epis: list[dict[str, Any]], rules: dict[str, list[str]]) -> None:
         with self._cfg_lock:
             self._custom_epis = list(epis)
+            self._camera_rules = {str(k): list(v) for k, v in rules.items()}
         self._reset_logic()
 
-    def _active_requirements(self) -> tuple[list[str], dict[str, str]]:
+    def _active_requirements(self, cam_key: Optional[str] = None) -> tuple[list[str], dict[str, str]]:
+        key = cam_key if cam_key is not None else self.ctx.camera_key
         with self._cfg_lock:
             customs = list(self._custom_epis)
-        req = list(self.base_required)
+            rules = dict(self._camera_rules)
+
         labels = dict(BASE_PPE_LABELS)
+        all_valid_ids = list(self.base_required)
         for epi in customs:
+            cid = str(epi["id"])
+            labels[cid] = str(epi["name"])
             if epi.get("enabled", True):
-                cid = str(epi["id"])
-                req.append(cid)
-                labels[cid] = str(epi["name"])
+                all_valid_ids.append(cid)
+
+        if key in rules:
+            allowed = set(all_valid_ids)
+            req = [eid for eid in rules[key] if eid in allowed]
+        else:
+            req = all_valid_ids
+
         return req, labels
 
     def get_output(self) -> tuple[Optional[np.ndarray], int, Snapshot]:
@@ -1092,9 +1358,11 @@ class SafetyEngine(threading.Thread):
             return None if self._raw_frame is None else self._raw_frame.copy()
 
     def stop(self) -> None:
+        self.siren.stop_alarm()
         self._halt.set()
 
     def _reset_logic(self) -> None:
+        self.siren.stop_alarm()
         self.filter = TemporalFilter(self.window, self.needed)
         self.missing_hist: deque[frozenset[str]] = deque(maxlen=self.window)
         self.count_hist: deque[int] = deque(maxlen=self.window)
@@ -1108,7 +1376,8 @@ class SafetyEngine(threading.Thread):
             zones = list(self._zones_norm)
         return zones_to_pixels(zones, w, h)
 
-    def _detect(self, frame: np.ndarray) -> list[Detection]:
+    def _detect(self, frame: np.ndarray, required: list[str]) -> list[Detection]:
+        req_set = set(required)
         dets: list[Detection] = []
         person_boxes: list[Detection] = []
 
@@ -1126,7 +1395,7 @@ class SafetyEngine(threading.Thread):
                 d = Detection(role, float(conf), (float(x1), float(y1), float(x2), float(y2)))
                 if role == "person":
                     person_boxes.append(d)
-                else:
+                elif role in req_set or role in ("no_ear", "no_glasses"):
                     dets.append(d)
 
         # 2. Detector auxiliar de operadores (yolov8n.pt)
@@ -1143,20 +1412,21 @@ class SafetyEngine(threading.Thread):
                     if not any(_iou(cand.box, existing.box) > 0.45 for existing in person_boxes):
                         person_boxes.append(cand)
 
-        # 3. Reforco visual para Fone de Concha Vermelho + EPIs Customizados cadastrados pelo Gerente
+        # 3. Ancoragem facial + EPIs Customizados ativos nesta camera
         with self._cfg_lock:
-            customs = [e for e in self._custom_epis if e.get("enabled", True)]
+            customs = [e for e in self._custom_epis if e.get("enabled", True) and str(e["id"]) in req_set]
 
         has_yolo_ear = any(d.role == "ear" for d in dets)
         for p in person_boxes:
-            if not has_yolo_ear:
+            if "ear" in req_set and not has_yolo_ear:
                 ear_match = detect_red_earmuffs_visual(frame, p.box)
                 if ear_match is not None:
                     conf_e, box_e = ear_match
                     dets.append(Detection("ear", conf_e, box_e, label_override="FONE"))
 
+            face_box = locate_face_in_person(frame, p.box) if customs else None
             for epi in customs:
-                match = match_custom_epi(frame, p.box, epi)
+                match = match_custom_epi(frame, p.box, epi, face_box=face_box)
                 if match is not None:
                     conf_c, box_c = match
                     dets.append(Detection(str(epi["id"]), conf_c, box_c, label_override=_norm(epi["name"]).upper()[:14]))
@@ -1199,7 +1469,7 @@ class SafetyEngine(threading.Thread):
         zone_polys = self._zones_px(w, h)
         required, labels_map = self._active_requirements()
 
-        dets = self._detect(frame)
+        dets = self._detect(frame, required)
         ev = evaluate_frame(dets, zone_polys, required)
         state, _ = self.filter.update(ev.raw_state)
         self.missing_hist.append(frozenset(ev.missing))
@@ -1211,6 +1481,7 @@ class SafetyEngine(threading.Thread):
         trigger = False
 
         if state == STATE_INFRACAO:
+            self.siren.start_alarm()
             missing = self._stable_missing(required)
             if self.inf_start is None:
                 self.inf_start = now
@@ -1222,6 +1493,7 @@ class SafetyEngine(threading.Thread):
                 self.registered = True
                 self.next_trigger = now + self.t_cooldown
         else:
+            self.siren.stop_alarm()
             self.inf_start = None
             self.next_trigger = None
             self.registered = False
@@ -1231,6 +1503,7 @@ class SafetyEngine(threading.Thread):
         if trigger:
             self._fire_infraction(annotated, missing, labels_map)
 
+        active_names = ", ".join(labels_map.get(r, r) for r in required) if required else "Nenhum EPI exigido"
         snap = Snapshot(
             state=state,
             missing=missing,
@@ -1239,6 +1512,7 @@ class SafetyEngine(threading.Thread):
             elapsed=elapsed,
             registered=self.registered,
             zones=len(zone_polys),
+            active_epis_text=active_names,
         )
         self._publish(annotated, snap)
 
@@ -1249,7 +1523,6 @@ class SafetyEngine(threading.Thread):
         labels = ", ".join(labels_map.get(m, m) for m in missing) or "EPI obrigatório"
         risk = f"Ausência de EPI ({labels})"
         image = annotated.copy()
-        play_alert(self.alert_cfg.get("beep_freq", 1200), self.alert_cfg.get("beep_ms", 350), self.alert_cfg.get("beep_count", 3))
 
         def _persist() -> None:
             try:
@@ -1298,7 +1571,110 @@ class SafetyEngine(threading.Thread):
 
 
 # ======================================================================
-# JANELAS AUXILIARES (login, zonas, cadastro de EPI, auditoria)
+# RECORTE ESTILO ROBOFLOW PARA CADASTRO DE EPI
+# ======================================================================
+class BoundingBoxCropperDialog(ctk.CTkToplevel):
+    """Permite ao cliente/Administrador demarcar o retangulo exato do EPI (estilo Roboflow)."""
+
+    CW, CH = 560, 380
+
+    def __init__(self, master, fonts: dict, image_bgr: np.ndarray, title_hint: str,
+                 on_cropped: Callable[[np.ndarray], None]) -> None:
+        super().__init__(master, fg_color=C["panel"])
+        self._img = image_bgr
+        self._on_cropped = on_cropped
+        self.title(f"Demarcar EPI (Estilo Roboflow) - {title_hint}")
+        self.resizable(False, False)
+        center_on(master, self, 600, 510)
+        self.transient(master)
+
+        fh, fw = image_bgr.shape[:2]
+        self._scale, self._nw, self._nh, self._ox, self._oy = letterbox_geometry(fw, fh, self.CW, self.CH)
+        canvas_img = letterbox(image_bgr, self.CW, self.CH)
+        self._photo = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(canvas_img, cv2.COLOR_BGR2RGB)))
+
+        self._start: Optional[tuple[int, int]] = None
+        self._rect_id: Optional[int] = None
+        self._box_canvas: Optional[tuple[int, int, int, int]] = None
+
+        ctk.CTkLabel(
+            self,
+            text="Arraste o mouse desenhando um retângulo APENAS ao redor da região desejada:",
+            font=fonts["small"], text_color=C["cyan"], width=560, height=28, anchor="w", wraplength=560
+        ).place(x=20, y=12)
+
+        self.canvas = tk.Canvas(self, width=self.CW, height=self.CH, bg="black",
+                                highlightthickness=1, highlightbackground=C["border"], cursor="crosshair")
+        self.canvas.place(x=20, y=46)
+        self.canvas.create_image(0, 0, image=self._photo, anchor="nw")
+        self.canvas.bind("<ButtonPress-1>", self._on_down)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_up)
+
+        ctk.CTkButton(self, text="✔ Confirmar Recorte", width=270, height=40, font=fonts["btn"],
+                      command=self._confirm, fg_color=C["cyan"], hover_color="#00B5D0", text_color="#04202B").place(x=20, y=444)
+        ctk.CTkButton(self, text="Usar Imagem Inteira", width=270, height=40, font=fonts["btn"],
+                      command=self._use_full, fg_color=C["border"], hover_color=C["card"]).place(x=310, y=444)
+        self.after(120, self._grab)
+
+    def _grab(self) -> None:
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+    def _on_down(self, event) -> None:
+        self._start = (event.x, event.y)
+        if self._rect_id is not None:
+            self.canvas.delete(self._rect_id)
+            self._rect_id = None
+
+    def _on_drag(self, event) -> None:
+        if self._start is None:
+            return
+        x1, y1 = self._start
+        x2, y2 = event.x, event.y
+        if self._rect_id is not None:
+            self.canvas.delete(self._rect_id)
+        self._rect_id = self.canvas.create_rectangle(x1, y1, x2, y2, outline=C["cyan"], width=3)
+
+    def _on_up(self, event) -> None:
+        if self._start is None:
+            return
+        x1, y1 = self._start
+        x2, y2 = event.x, event.y
+        self._box_canvas = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+
+    def _confirm(self) -> None:
+        if self._box_canvas is None:
+            messagebox.showwarning("Recorte", "Desenhe um retângulo ao redor da região ou clique em 'Usar Imagem Inteira'.", parent=self)
+            return
+        cx1, cy1, cx2, cy2 = self._box_canvas
+        if (cx2 - cx1) < 10 or (cy2 - cy1) < 10:
+            messagebox.showwarning("Recorte", "Retângulo muito pequeno. Arraste sobre a região.", parent=self)
+            return
+        fh, fw = self._img.shape[:2]
+        ix1 = int(max(0, min(fw - 1, (cx1 - self._ox) / self._scale)))
+        iy1 = int(max(0, min(fh - 1, (cy1 - self._oy) / self._scale)))
+        ix2 = int(max(1, min(fw, (cx2 - self._ox) / self._scale)))
+        iy2 = int(max(1, min(fh, (cy2 - self._oy) / self._scale)))
+        if (ix2 - ix1) < 8 or (iy2 - iy1) < 8:
+            self._use_full()
+            return
+        crop = self._img[iy1:iy2, ix1:ix2].copy()
+        cb = self._on_cropped
+        self.destroy()
+        cb(crop)
+
+    def _use_full(self) -> None:
+        cb = self._on_cropped
+        img = self._img.copy()
+        self.destroy()
+        cb(img)
+
+
+# ======================================================================
+# JANELAS AUXILIARES (login, zonas, cadastro/regras de EPI, auditoria)
 # ======================================================================
 def make_fonts() -> dict[str, ctk.CTkFont]:
     return {
@@ -1326,14 +1702,14 @@ class LoginDialog(ctk.CTkToplevel):
         super().__init__(master, fg_color=C["panel"])
         self._password = password
         self._on_success = on_success
-        self.title("Acesso restrito - Gerente")
+        self.title("Acesso restrito - Administrador")
         self.resizable(False, False)
         center_on(master, self, 400, 250)
         self.transient(master)
 
-        ctk.CTkLabel(self, text="🔐 Acesso do Gerente", font=fonts["h2"], text_color=C["cyan"], width=360, height=30, anchor="w").place(x=20, y=18)
-        ctk.CTkLabel(self, text="Informe a senha para liberar esta função.", font=fonts["small"], text_color=C["muted"], width=360, height=22, anchor="w").place(x=20, y=52)
-        self.entry = ctk.CTkEntry(self, show="•", width=360, height=38, placeholder_text="Senha", font=fonts["body"])
+        ctk.CTkLabel(self, text="🔐 Acesso do Administrador", font=fonts["h2"], text_color=C["cyan"], width=360, height=30, anchor="w").place(x=20, y=18)
+        ctk.CTkLabel(self, text="Informe a senha de administrador para liberar esta função.", font=fonts["small"], text_color=C["muted"], width=360, height=22, anchor="w").place(x=20, y=52)
+        self.entry = ctk.CTkEntry(self, show="•", width=360, height=38, placeholder_text="Senha do Administrador", font=fonts["body"])
         self.entry.place(x=20, y=88)
         self.error = ctk.CTkLabel(self, text="", font=fonts["small"], text_color=C["red"], width=360, height=22, anchor="w")
         self.error.place(x=20, y=134)
@@ -1363,86 +1739,101 @@ class LoginDialog(ctk.CTkToplevel):
 
 
 class CustomEPIManagerDialog(ctk.CTkToplevel):
-    """Janela exclusiva do Gerente para cadastrar e gerenciar EPIs customizados por fotos."""
+    """Janela do Administrador para cadastrar novos EPIs (estilo Roboflow + webcam + referencia negativa)."""
 
     REGIONS = {
-        "Rosto / Boca (ex: Máscara de Solda, Respirador)": "face",
-        "Cabeça / Orelhas (ex: Capacete, Touca)": "head",
-        "Tronco / Corpo (ex: Avental de Raspa, Colete)": "torso",
+        "Nariz / Boca (ex: Máscara Hospitalar, Respirador)": "mouth",
+        "Faixa dos Olhos (ex: Óculos de Proteção, Viseira)": "eyes",
+        "Cabeça / Orelhas (ex: Capacete, Boné, Abafador)": "head",
+        "Tronco / Corpo (ex: Avental, Colete Refletivo)": "torso",
     }
 
-    def __init__(self, master, fonts: dict, on_updated: Callable[[list[dict[str, Any]]], None]) -> None:
+    def __init__(self, master, fonts: dict, cameras: list[dict[str, Any]], active_cam_idx: int,
+                 base_required: list[str], get_live_frame: Callable[[], Optional[np.ndarray]],
+                 on_updated: Callable[[list[dict[str, Any]], dict[str, list[str]]], None]) -> None:
         super().__init__(master, fg_color=C["panel"])
         self._on_updated = on_updated
+        self._get_live_frame = get_live_frame
+        self.cameras = cameras
+        self.base_required = list(base_required)
         self.epis: list[dict[str, Any]] = load_custom_epis()
-        self.selected_files: list[Path] = []
-        self.title("Gerenciar e Cadastrar EPIs Customizados - SafeWork")
+        self.rules: dict[str, list[str]] = load_camera_rules()
+        self.cropped_samples: list[np.ndarray] = []
+        self.negative_samples: list[np.ndarray] = []
+        self.check_vars: dict[str, tk.BooleanVar] = {}
+
+        self.title("Gerenciar EPIs por Câmera e Cadastrar Novos - SafeWork")
         self.resizable(False, False)
-        center_on(master, self, 920, 560)
+        center_on(master, self, 960, 620)
         self.transient(master)
 
-        ctk.CTkLabel(self, text="🦺 Cadastro de EPIs por Visão Computacional (Exclusivo Gerente)",
-                     font=fonts["h2"], text_color=C["cyan"], width=880, height=30, anchor="w").place(x=20, y=14)
-        ctk.CTkLabel(self, text="Cadastre novos EPIs específicos do cliente (ex: Máscara de Solda) enviando fotos de vários ângulos.",
-                     font=fonts["small"], text_color=C["muted"], width=880, height=22, anchor="w").place(x=20, y=46)
+        ctk.CTkLabel(self, text="🦺 Configuração de EPIs por Área / Câmera e Cadastro Dinâmico",
+                     font=fonts["h2"], text_color=C["cyan"], width=920, height=30, anchor="w").place(x=20, y=14)
+        ctk.CTkLabel(self, text="Demarque o EPI na foto ou câmera. Para óculos/transparentes, capture 1 amostra SEM o EPI para precisão absoluta.",
+                     font=fonts["small"], text_color=C["muted"], width=920, height=22, anchor="w").place(x=20, y=46)
 
-        # Coluna Esquerda: Formulario de Novo EPI
-        form = ctk.CTkFrame(self, width=420, height=450, corner_radius=12, fg_color=C["card"], border_width=1, border_color=C["border"])
-        form.place(x=20, y=82)
+        form = ctk.CTkFrame(self, width=420, height=520, corner_radius=12, fg_color=C["card"], border_width=1, border_color=C["border"])
+        form.place(x=20, y=80)
         form.pack_propagate(False)
 
-        ctk.CTkLabel(form, text="Novo EPI Obrigatório", font=fonts["h2"], text_color=C["text"], width=380, height=28, anchor="w").place(x=20, y=16)
+        ctk.CTkLabel(form, text="1. Cadastrar Novo EPI (Recorte Guiado)", font=fonts["h2"], text_color=C["text"], width=380, height=28, anchor="w").place(x=20, y=12)
 
-        ctk.CTkLabel(form, text="Nome do EPI:", font=fonts["small"], text_color=C["muted"], width=380, height=20, anchor="w").place(x=20, y=54)
-        self.name_entry = ctk.CTkEntry(form, width=380, height=36, placeholder_text="Ex: Máscara de Solda", font=fonts["body"])
-        self.name_entry.place(x=20, y=78)
+        ctk.CTkLabel(form, text="Nome do EPI:", font=fonts["small"], text_color=C["muted"], width=380, height=20, anchor="w").place(x=20, y=44)
+        self.name_entry = ctk.CTkEntry(form, width=380, height=36, placeholder_text="Ex: Óculos com Grau / Máscara / Boné", font=fonts["body"])
+        self.name_entry.place(x=20, y=66)
 
-        ctk.CTkLabel(form, text="Região de uso no operador:", font=fonts["small"], text_color=C["muted"], width=380, height=20, anchor="w").place(x=20, y=126)
+        ctk.CTkLabel(form, text="Região anatômica de verificação:", font=fonts["small"], text_color=C["muted"], width=380, height=20, anchor="w").place(x=20, y=108)
         self.region_menu = ctk.CTkOptionMenu(form, values=list(self.REGIONS.keys()), width=380, height=36,
                                              dynamic_resizing=False, font=fonts["small"], fg_color=C["border"],
                                              button_color=C["border"], button_hover_color=C["panel"])
-        self.region_menu.place(x=20, y=150)
+        self.region_menu.place(x=20, y=130)
 
-        ctk.CTkLabel(form, text="Amostras visuais (vários ângulos):", font=fonts["small"], text_color=C["muted"], width=380, height=20, anchor="w").place(x=20, y=200)
-        ctk.CTkButton(form, text="📁 Selecionar Fotos do EPI...", width=380, height=38, font=fonts["btn"],
-                      command=self._pick_images, fg_color=C["border"], hover_color=C["panel"]).place(x=20, y=226)
-        self.lbl_files = ctk.CTkLabel(form, text="Nenhuma foto selecionada.", font=fonts["small"], text_color=C["amber"],
-                                      width=380, height=40, anchor="nw", wraplength=380, justify="left")
-        self.lbl_files.place(x=20, y=272)
+        ctk.CTkButton(form, text="📁 Abrir Foto e Demarcar EPI...", width=380, height=36, font=fonts["btn"],
+                      command=self._pick_and_crop_image, fg_color=C["border"], hover_color=C["panel"]).place(x=20, y=178)
 
-        ctk.CTkButton(form, text="✔ Treinar e Salvar EPI", width=380, height=44, font=fonts["btn"],
-                      command=self._register_epi, fg_color=C["cyan"], hover_color="#00B5D0", text_color="#04202B").place(x=20, y=384)
+        ctk.CTkButton(form, text="📸 Capturar COM EPI (Câmera Agora)...", width=380, height=36, font=fonts["btn"],
+                      command=lambda: self._capture_and_crop_live(negative=False), fg_color=C["border"], hover_color=C["panel"]).place(x=20, y=222)
 
-        # Coluna Direita: Lista de EPIs cadastrados
-        right_box = ctk.CTkFrame(self, width=440, height=450, corner_radius=12, fg_color=C["card"], border_width=1, border_color=C["border"])
-        right_box.place(x=460, y=82)
+        ctk.CTkButton(form, text="🚫 Capturar SEM EPI (Referência Negativa)...", width=380, height=36, font=fonts["small"],
+                      command=lambda: self._capture_and_crop_live(negative=True), fg_color=C["gray_bg"], hover_color=C["border"]).place(x=20, y=266)
+
+        self.lbl_files = ctk.CTkLabel(form, text="0 amostra(s) COM EPI  |  0 amostra(s) SEM EPI", font=fonts["small"], text_color=C["amber"],
+                                      width=380, height=36, anchor="nw", wraplength=380, justify="left")
+        self.lbl_files.place(x=20, y=310)
+
+        ctk.CTkButton(form, text="✔ Salvar e Ativar EPI na Câmera", width=380, height=42, font=fonts["btn"],
+                      command=self._register_epi, fg_color=C["cyan"], hover_color="#00B5D0", text_color="#04202B").place(x=20, y=354)
+
+        ctk.CTkButton(form, text="Limpar Amostras", width=185, height=36, font=fonts["small"],
+                      command=self._clear_pending, fg_color=C["gray_bg"], hover_color=C["border"]).place(x=20, y=466)
+        ctk.CTkButton(form, text="🗑 Excluir EPI Customizado", width=185, height=36, font=fonts["small"],
+                      command=self._delete_selected_custom, fg_color=C["red_bg"], hover_color=C["red"]).place(x=215, y=466)
+
+        right_box = ctk.CTkFrame(self, width=480, height=520, corner_radius=12, fg_color=C["card"], border_width=1, border_color=C["border"])
+        right_box.place(x=460, y=80)
         right_box.pack_propagate(False)
 
-        ctk.CTkLabel(right_box, text="EPIs Customizados Cadastrados", font=fonts["h2"], text_color=C["text"], width=400, height=28, anchor="w").place(x=20, y=16)
+        ctk.CTkLabel(right_box, text="2. EPIs Obrigatórios por Câmera / Setor", font=fonts["h2"], text_color=C["text"], width=440, height=28, anchor="w").place(x=20, y=14)
 
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure("Epi.Treeview", background=C["panel"], fieldbackground=C["panel"], foreground=C["text"],
-                        rowheight=28, borderwidth=0, font=(FONT_FAMILY, 10))
-        style.configure("Epi.Treeview.Heading", background=C["border"], foreground=C["cyan"], font=(FONT_FAMILY, 10, "bold"))
+        ctk.CTkLabel(right_box, text="Selecione a câmera / zona:", font=fonts["small"], text_color=C["muted"], width=440, height=20, anchor="w").place(x=20, y=48)
+        cam_names = [c["name"] for c in self.cameras]
+        self.cam_selector = ctk.CTkOptionMenu(right_box, values=cam_names, width=440, height=36,
+                                              dynamic_resizing=False, font=fonts["body"],
+                                              command=lambda _v: self._render_checklist(),
+                                              fg_color=C["border"], button_color=C["border"], button_hover_color=C["panel"])
+        self.cam_selector.place(x=20, y=72)
+        self.cam_selector.set(cam_names[active_cam_idx])
 
-        self.tree = ttk.Treeview(right_box, columns=("nome", "regiao", "fotos", "status"), show="headings", style="Epi.Treeview", height=10)
-        self.tree.heading("nome", text="EPI")
-        self.tree.heading("regiao", text="Região")
-        self.tree.heading("fotos", text="Ângulos")
-        self.tree.heading("status", text="Status")
-        self.tree.column("nome", width=150, anchor="w")
-        self.tree.column("regiao", width=100, anchor="w")
-        self.tree.column("fotos", width=65, anchor="center")
-        self.tree.column("status", width=85, anchor="center")
-        self.tree.place(x=20, y=54, width=400, height=310)
+        self.scroll = ctk.CTkScrollableFrame(right_box, width=418, height=300, fg_color=C["panel"], corner_radius=8)
+        self.scroll.place(x=20, y=120)
 
-        ctk.CTkButton(right_box, text="Ativar / Pausar", width=190, height=40, font=fonts["btn"],
-                      command=self._toggle_selected, fg_color=C["border"], hover_color=C["panel"]).place(x=20, y=384)
-        ctk.CTkButton(right_box, text="Excluir EPI", width=190, height=40, font=fonts["btn"],
-                      command=self._delete_selected, fg_color=C["red_bg"], hover_color=C["red"]).place(x=230, y=384)
+        ctk.CTkButton(right_box, text="Aplicar nesta Câmera", width=215, height=42, font=fonts["btn"],
+                      command=lambda: self._save_rules(apply_all=False), fg_color=C["cyan"], hover_color="#00B5D0", text_color="#04202B").place(x=20, y=460)
+        ctk.CTkButton(right_box, text="Aplicar em Todas", width=215, height=42, font=fonts["btn"],
+                      command=lambda: self._save_rules(apply_all=True), fg_color=C["border"], hover_color=C["panel"]).place(x=245, y=460)
 
-        self._refresh_list()
+        self._selected_custom_id: Optional[str] = None
+        self._render_checklist()
         self.after(150, self._grab)
 
     def _grab(self) -> None:
@@ -1451,23 +1842,96 @@ class CustomEPIManagerDialog(ctk.CTkToplevel):
         except tk.TclError:
             pass
 
-    def _pick_images(self) -> None:
-        files = filedialog.askopenfilenames(
+    def _current_cam_key(self) -> str:
+        names = [c["name"] for c in self.cameras]
+        idx = names.index(self.cam_selector.get())
+        return str(self.cameras[idx]["source"])
+
+    def _all_epi_items(self) -> list[tuple[str, str, str]]:
+        items: list[tuple[str, str, str]] = []
+        for bid in self.base_required:
+            items.append((bid, BASE_PPE_LABELS.get(bid, bid), "Nativo (YOLOv8)"))
+        for epi in self.epis:
+            items.append((str(epi["id"]), str(epi["name"]), f"Custom ({epi.get('samples', 1)} recortes)"))
+        return items
+
+    def _render_checklist(self) -> None:
+        for child in self.scroll.winfo_children():
+            child.destroy()
+        self.check_vars.clear()
+        self._selected_custom_id = None
+
+        cam_key = self._current_cam_key()
+        all_items = self._all_epi_items()
+        active_set = set(self.rules[cam_key]) if cam_key in self.rules else {eid for eid, _, _ in all_items}
+
+        for eid, label, origin in all_items:
+            row = ctk.CTkFrame(self.scroll, fg_color=C["card"], corner_radius=6, height=40)
+            row.pack(fill="x", pady=4, padx=4)
+            var = tk.BooleanVar(value=(eid in active_set))
+            self.check_vars[eid] = var
+            cb = ctk.CTkCheckBox(row, text=f"{label}", variable=var, font=self.master.fonts["body"],
+                                 fg_color=C["cyan"], hover_color="#00B5D0", text_color=C["text"])
+            cb.pack(side="left", padx=10, pady=6)
+            tag = ctk.CTkLabel(row, text=origin, font=self.master.fonts["tiny"],
+                               text_color=C["cyan"] if "Nativo" in origin else C["amber"])
+            tag.pack(side="right", padx=10)
+            if eid.startswith("custom_"):
+                row.bind("<Button-1>", lambda _e, cid=eid: setattr(self, "_selected_custom_id", cid))
+
+    def _update_counts(self) -> None:
+        self.lbl_files.configure(
+            text=f"{len(self.cropped_samples)} amostra(s) COM EPI  |  {len(self.negative_samples)} amostra(s) SEM EPI",
+            text_color=C["green"] if self.cropped_samples else C["amber"],
+        )
+
+    def _add_cropped_sample(self, crop: np.ndarray, negative: bool = False) -> None:
+        if negative:
+            self.negative_samples.append(crop)
+        else:
+            self.cropped_samples.append(crop)
+        self._update_counts()
+
+    def _pick_and_crop_image(self) -> None:
+        file_path = filedialog.askopenfilename(
             parent=self,
-            title="Selecione fotos do EPI em diferentes ângulos",
+            title="Selecione uma foto do EPI para demarcar",
             filetypes=[("Imagens", "*.png *.jpg *.jpeg *.bmp *.webp")],
         )
-        if files:
-            self.selected_files = [Path(f) for f in files]
-            self.lbl_files.configure(text=f"{len(self.selected_files)} foto(s) carregada(s) pronta(s) para leitura.", text_color=C["green"])
+        if not file_path:
+            return
+        img = _imread_unicode(file_path)
+        if img is None:
+            messagebox.showerror("Imagem", "Não foi possível abrir esta imagem.", parent=self)
+            return
+        BoundingBoxCropperDialog(
+            self, self.master.fonts, img, Path(file_path).name,
+            lambda c: self._add_cropped_sample(c, negative=False)
+        )
+
+    def _capture_and_crop_live(self, negative: bool = False) -> None:
+        frame = self._get_live_frame()
+        if frame is None:
+            messagebox.showwarning("Câmera", "Sem imagem ao vivo da câmera no momento.", parent=self)
+            return
+        hint = "SEM EPI (Referência Negativa)" if negative else "COM EPI"
+        BoundingBoxCropperDialog(
+            self, self.master.fonts, frame, hint,
+            lambda c: self._add_cropped_sample(c, negative=negative)
+        )
+
+    def _clear_pending(self) -> None:
+        self.cropped_samples.clear()
+        self.negative_samples.clear()
+        self._update_counts()
 
     def _register_epi(self) -> None:
         name = self.name_entry.get().strip()
         if not name:
-            messagebox.showwarning("Cadastro de EPI", "Informe o nome do EPI (ex: Máscara de Solda).", parent=self)
+            messagebox.showwarning("Cadastro de EPI", "Informe o nome do EPI.", parent=self)
             return
-        if not self.selected_files:
-            messagebox.showwarning("Cadastro de EPI", "Selecione pelo menos uma foto do EPI.", parent=self)
+        if not self.cropped_samples:
+            messagebox.showwarning("Cadastro de EPI", "Demarque pelo menos 1 recorte COM EPI.", parent=self)
             return
 
         region = self.REGIONS[self.region_menu.get()]
@@ -1476,16 +1940,21 @@ class CustomEPIManagerDialog(ctk.CTkToplevel):
         target_dir.mkdir(parents=True, exist_ok=True)
 
         signatures = []
-        for idx, src_path in enumerate(self.selected_files, start=1):
-            img = _imread_unicode(src_path)
-            if img is None:
-                continue
-            signatures.append(extract_visual_signature(img))
-            dst = target_dir / f"angulo_{idx}.png"
-            imwrite_unicode(dst, img)
+        for idx, crop in enumerate(self.cropped_samples, start=1):
+            sig = extract_visual_signature(crop)
+            if sig:
+                signatures.append(sig)
+                imwrite_unicode(target_dir / f"com_epi_{idx}.png", crop)
+
+        neg_signatures = []
+        for idx, crop in enumerate(self.negative_samples, start=1):
+            sig = extract_visual_signature(crop)
+            if sig:
+                neg_signatures.append(sig)
+                imwrite_unicode(target_dir / f"sem_epi_{idx}.png", crop)
 
         if not signatures:
-            messagebox.showerror("Cadastro de EPI", "Não foi possível ler as imagens selecionadas.", parent=self)
+            messagebox.showerror("Cadastro de EPI", "Não foi possível extrair características dos recortes.", parent=self)
             return
 
         new_epi = {
@@ -1493,49 +1962,53 @@ class CustomEPIManagerDialog(ctk.CTkToplevel):
             "name": name,
             "region": region,
             "samples": len(signatures),
-            "threshold": 0.56,
+            "threshold": 0.64,
             "enabled": True,
             "signatures": signatures,
+            "negative_signatures": neg_signatures,
         }
         self.epis.append(new_epi)
         save_custom_epis(self.epis)
-        self._on_updated(self.epis)
+
+        cam_key = self._current_cam_key()
+        if cam_key not in self.rules:
+            self.rules[cam_key] = [eid for eid, _, _ in self._all_epi_items()]
+        elif epi_id not in self.rules[cam_key]:
+            self.rules[cam_key].append(epi_id)
+        save_camera_rules(self.rules)
+        self._on_updated(self.epis, self.rules)
 
         self.name_entry.delete(0, "end")
-        self.selected_files = []
-        self.lbl_files.configure(text="EPI cadastrado e ativado no monitoramento!", text_color=C["cyan"])
-        self._refresh_list()
+        self.cropped_samples.clear()
+        self.negative_samples.clear()
+        self.lbl_files.configure(text=f"'{name}' cadastrado e ativado com calibração diferencial!", text_color=C["cyan"])
+        self._render_checklist()
 
-    def _refresh_list(self) -> None:
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        reg_names = {"face": "Rosto", "head": "Cabeça", "torso": "Tronco"}
-        for epi in self.epis:
-            status = "Ativo" if epi.get("enabled", True) else "Pausado"
-            self.tree.insert("", "end", iid=epi["id"], values=(epi["name"], reg_names.get(epi["region"], epi["region"]), epi.get("samples", 1), status))
-
-    def _toggle_selected(self) -> None:
-        sel = self.tree.selection()
-        if not sel:
+    def _delete_selected_custom(self) -> None:
+        customs = [e for e in self.epis if str(e["id"]).startswith("custom_")]
+        if not customs:
+            messagebox.showinfo("EPIs Customizados", "Não há EPIs customizados cadastrados.", parent=self)
             return
-        eid = sel[0]
-        for epi in self.epis:
-            if epi["id"] == eid:
-                epi["enabled"] = not epi.get("enabled", True)
-                break
+        target_id = self._selected_custom_id or str(customs[-1]["id"])
+        self.epis = [e for e in self.epis if str(e["id"]) != target_id]
+        for k in list(self.rules.keys()):
+            self.rules[k] = [eid for eid in self.rules[k] if eid != target_id]
         save_custom_epis(self.epis)
-        self._on_updated(self.epis)
-        self._refresh_list()
+        save_camera_rules(self.rules)
+        self._on_updated(self.epis, self.rules)
+        self._render_checklist()
 
-    def _delete_selected(self) -> None:
-        sel = self.tree.selection()
-        if not sel:
-            return
-        eid = sel[0]
-        self.epis = [e for e in self.epis if e["id"] != eid]
-        save_custom_epis(self.epis)
-        self._on_updated(self.epis)
-        self._refresh_list()
+    def _save_rules(self, apply_all: bool) -> None:
+        selected = [eid for eid, var in self.check_vars.items() if var.get()]
+        if apply_all:
+            for cam in self.cameras:
+                self.rules[str(cam["source"])] = list(selected)
+        else:
+            self.rules[self._current_cam_key()] = list(selected)
+        save_camera_rules(self.rules)
+        self._on_updated(self.epis, self.rules)
+        scope = "todas as câmeras" if apply_all else self.cam_selector.get()
+        messagebox.showinfo("Regras Salvas", f"EPIs obrigatórios atualizados para {scope} ({len(selected)} item(ns)).", parent=self)
 
 
 class ZoneEditor(ctk.CTkToplevel):
@@ -1673,8 +2146,8 @@ class AuditWindow(ctk.CTkToplevel):
 
         cols = ("id", "data", "camera", "perfil", "risco", "arquivo")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", style="Safe.Treeview", height=16)
-        heads = {"id": ("ID", 50), "data": ("Data/Hora", 150), "camera": ("Câmera", 110), "perfil": ("Perfil", 90),
-                 "risco": ("Tipo de risco", 340), "arquivo": ("Evidência (PNG)", 260)}
+        heads = {"id": ("ID", 50), "data": ("Data/Hora", 150), "camera": ("Câmera", 110), "perfil": ("Perfil", 115),
+                 "risco": ("Tipo de risco", 315), "arquivo": ("Evidência (PNG)", 260)}
         for key, (title, width) in heads.items():
             self.tree.heading(key, text=title)
             self.tree.column(key, width=width, anchor="w", stretch=False)
@@ -1805,9 +2278,10 @@ class SafeWorkApp(ctk.CTk):
         self.cameras = self._normalize_cameras(settings["cameras"])
         self.profile = "Operador"
         self.password = str(settings["security"]["manager_password"])
-        self.ctx = RuntimeContext(self.cameras[0]["name"], self.profile)
+        self.ctx = RuntimeContext(self.cameras[0]["name"], str(self.cameras[0]["source"]), self.profile)
         self.store = AuditStore()
         self.zones_by_cam = load_zones()
+        self.siren = ProgressiveSiren()
 
         self.cam: Optional[CameraSource] = None
         self.engine: Optional[SafetyEngine] = None
@@ -1852,7 +2326,7 @@ class SafeWorkApp(ctk.CTk):
         self.cam = CameraSource(self.cameras, self.settings["capture"], 0)
         self.engine = SafetyEngine(
             self._boot["ppe_model"], self._boot["person_model"], self._boot["roles"],
-            self.settings, self.cam, self.store, self.ctx
+            self.settings, self.cam, self.store, self.ctx, self.siren
         )
         self.engine.set_zones(self.zones_by_cam.get(self._cam_key(0), []))
         self.cam.start()
@@ -1907,11 +2381,16 @@ class SafeWorkApp(ctk.CTk):
             ctk.CTkLabel(self.left, text=text, font=f["small"], text_color=color, width=200, height=26, anchor="w").place(x=x, y=596)
             x += 210
 
-        info = ("Regra de decisão: Operador (X) na área e EPI obrigatório (Y) ausente → INFRAÇÃO. "
-                "Operador (X) com todos os EPIs (Y) → CONFORME. O estado só muda quando a mesma condição "
-                "se mantém em, no mínimo, 7 dos últimos 10 quadros.")
-        ctk.CTkLabel(self.left, text=info, font=f["small"], text_color=C["muted"], width=VIDEO_W, height=60,
-                     wraplength=VIDEO_W - 8, justify="left", anchor="nw").place(x=ox, y=632)
+        self.lbl_active_epis = ctk.CTkLabel(
+            self.left, text="EPIs exigidos nesta câmera: ...", font=f["small"], text_color=C["cyan"],
+            width=VIDEO_W, height=24, anchor="w"
+        )
+        self.lbl_active_epis.place(x=ox, y=626)
+
+        info = ("Regra de decisão: Operador (X) na área e EPI obrigatório (Y) ausente → INFRAÇÃO (alarme progressivo). "
+                "Operador (X) com EPIs completos ou fora da área → CONFORME (silencioso).")
+        ctk.CTkLabel(self.left, text=info, font=f["small"], text_color=C["muted"], width=VIDEO_W, height=44,
+                     wraplength=VIDEO_W - 8, justify="left", anchor="nw").place(x=ox, y=654)
 
     def _build_right(self, f: dict) -> None:
         r = self.right
@@ -1956,11 +2435,11 @@ class SafeWorkApp(ctk.CTk):
 
         prof_card = self._card(r, pad, 430, cw, 72)
         ctk.CTkLabel(prof_card, text="PERFIL ATIVO", font=f["tiny"], text_color=C["muted"], width=200, height=16, anchor="w").place(x=16, y=6)
-        self.lbl_profile = ctk.CTkLabel(prof_card, text="Operador", font=f["title"], text_color=C["cyan"], width=240, height=34, anchor="w")
+        self.lbl_profile = ctk.CTkLabel(prof_card, text="Operador", font=f["title"], text_color=C["cyan"], width=215, height=34, anchor="w")
         self.lbl_profile.place(x=16, y=26)
-        self.btn_login = ctk.CTkButton(prof_card, text="Login Gerente", width=150, height=34, font=f["btn"],
+        self.btn_login = ctk.CTkButton(prof_card, text="Login Administrador", width=185, height=34, font=f["btn"],
                                        command=self._toggle_login, fg_color=C["border"], hover_color=C["panel"])
-        self.btn_login.place(x=cw - 168, y=19)
+        self.btn_login.place(x=cw - 200, y=19)
 
         self.btn_zones = ctk.CTkButton(r, text="", width=cw, height=40, font=f["btn"], command=lambda: self._guard(self._open_zone_editor),
                                        fg_color=C["card"], hover_color=C["border"], border_width=1, border_color=C["border"], anchor="w")
@@ -1990,10 +2469,10 @@ class SafeWorkApp(ctk.CTk):
         self._cfg_cache[key] = dict(kw)
 
     def _refresh_profile_ui(self) -> None:
-        manager = self.profile == "Gerente"
-        lock = "" if manager else "🔒 "
-        self.lbl_profile.configure(text=self.profile, text_color=C["amber"] if manager else C["cyan"])
-        self.btn_login.configure(text="Sair do modo Gerente" if manager else "Login Gerente")
+        admin = self.profile == "Administrador"
+        lock = "" if admin else "🔒 "
+        self.lbl_profile.configure(text=self.profile, text_color=C["amber"] if admin else C["cyan"])
+        self.btn_login.configure(text="Sair do Administrador" if admin else "Login Administrador")
         self.btn_zones.configure(text=f"{lock}Delimitar Zonas de Risco")
         self.btn_epis.configure(text=f"{lock}🦺 Gerenciar / Cadastrar EPIs")
         self.btn_audit.configure(text=f"{lock}Acessar Relatórios de Auditoria")
@@ -2001,20 +2480,20 @@ class SafeWorkApp(ctk.CTk):
         self.ctx.profile = self.profile
 
     def _guard(self, action: Callable[[], None]) -> None:
-        if self.profile == "Gerente":
+        if self.profile == "Administrador":
             action()
             return
-        LoginDialog(self, self.fonts, self.password, lambda: (self._set_profile("Gerente"), action()))
+        LoginDialog(self, self.fonts, self.password, lambda: (self._set_profile("Administrador"), action()))
 
     def _set_profile(self, profile: str) -> None:
         self.profile = profile
         self._refresh_profile_ui()
 
     def _toggle_login(self) -> None:
-        if self.profile == "Gerente":
+        if self.profile == "Administrador":
             self._set_profile("Operador")
         else:
-            LoginDialog(self, self.fonts, self.password, lambda: self._set_profile("Gerente"))
+            LoginDialog(self, self.fonts, self.password, lambda: self._set_profile("Administrador"))
 
     def _open_zone_editor(self) -> None:
         assert self.engine is not None
@@ -2027,13 +2506,17 @@ class SafeWorkApp(ctk.CTk):
                    self.cameras[idx]["name"], lambda zones, i=idx: self._apply_zones(i, zones))
 
     def _open_custom_epis(self) -> None:
-        def _on_epis_changed(updated: list[dict[str, Any]]) -> None:
-            if self.engine is not None:
-                self.engine.reload_custom_epis(updated)
-            active_count = sum(1 for e in updated if e.get("enabled", True))
-            self._flash(f"Lista de EPIs atualizada ({active_count} EPI(s) customizado(s) ativo(s)).")
+        assert self.engine is not None
 
-        CustomEPIManagerDialog(self, self.fonts, _on_epis_changed)
+        def _on_epis_changed(updated_epis: list[dict[str, Any]], updated_rules: dict[str, list[str]]) -> None:
+            if self.engine is not None:
+                self.engine.reload_ppe_config(updated_epis, updated_rules)
+            self._flash("Regras de EPIs por câmera atualizadas e aplicadas.")
+
+        CustomEPIManagerDialog(
+            self, self.fonts, self.cameras, self._active_cam_index,
+            self.engine.base_required, self.engine.get_raw_frame, _on_epis_changed
+        )
 
     def _apply_zones(self, cam_index: int, zones: list[list[list[float]]]) -> None:
         key = self._cam_key(cam_index)
@@ -2069,7 +2552,7 @@ class SafeWorkApp(ctk.CTk):
         idx = names.index(name)
         if idx != self._active_cam_index:
             self.cam.request_switch(idx)
-            self._flash(f"Abrindo {name}...", 4.0)
+            self._flash(f"Conectando {name}...", 4.0)
 
     def _sync_camera(self) -> None:
         assert self.cam is not None and self.engine is not None
@@ -2077,6 +2560,7 @@ class SafeWorkApp(ctk.CTk):
         if idx != self._active_cam_index:
             self._active_cam_index = idx
             self.ctx.camera_name = self.cameras[idx]["name"]
+            self.ctx.camera_key = self._cam_key(idx)
             self.engine.set_zones(self.zones_by_cam.get(self._cam_key(idx), []))
             self.cam_menu.set(self.cameras[idx]["name"])
         if self.cam.message:
@@ -2115,15 +2599,18 @@ class SafeWorkApp(ctk.CTk):
         self.video_label.configure(image=self._photo)
 
     def _render_panel(self, s: Snapshot) -> None:
-        limit = self.engine.t_infraction if self.engine else 5.0
+        limit = self.engine.t_infraction if self.engine else 3.0
         _, labels_map = self.engine._active_requirements() if self.engine else ([], BASE_PPE_LABELS)
+        if s.active_epis_text:
+            self._cfg(self.lbl_active_epis, text=f"EPIs obrigatórios nesta câmera: {s.active_epis_text}")
+
         if s.state == STATE_INFRACAO:
             self._cfg(self.status_card, fg_color=C["red_bg"], border_color=C["red"])
             self._cfg(self.lbl_status, text="ALERTA DE INFRAÇÃO", text_color=C["red"])
             labels = ", ".join(labels_map.get(m, m) for m in s.missing) or "EPI obrigatório"
             self._cfg(self.lbl_detail, text=f"EPI ausente: {labels}")
             if s.registered:
-                self._cfg(self.lbl_timer, text="✔ Infração registrada • evidência salva na auditoria")
+                self._cfg(self.lbl_timer, text="🔊 Sirene ativa • Infração registrada na auditoria")
                 self._cfg(self.bar_timer, progress_color=C["red"])
                 self.bar_timer.set(1.0)
             else:
@@ -2151,6 +2638,7 @@ class SafeWorkApp(ctk.CTk):
 
     def _on_close(self) -> None:
         self._closing = True
+        self.siren.shutdown()
         if self._tick_job is not None:
             try:
                 self.after_cancel(self._tick_job)

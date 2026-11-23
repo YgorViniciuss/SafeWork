@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "rules": {
+    "0": [
+      "ear",
+      "custom_1795405024"
+    ],
+    "1": [
+      "glasses"
+    ],
+    "rtsp://admin:1507YGOR*@192.168.0.111:554/onvif2": []
+  }
+}
